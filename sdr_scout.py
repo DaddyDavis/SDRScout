@@ -318,7 +318,10 @@ class SDRScout:
 
         analysis_text = Text()
         for line in self.diagnostic_analysis:
-            analysis_text.append(f"{line}\n")
+            try:
+                analysis_text.append_text(Text.from_markup(f"{line}\n"))
+            except Exception:
+                analysis_text.append(f"{line}\n")
         left_layout["analysis_box"].update(Panel(analysis_text, title=f"Tactical Analysis ({self.active_test_name})", border_style="cyan"))
 
         raw_text = Text()
