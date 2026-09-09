@@ -1,4 +1,5 @@
 import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import sys
 import json
 import time
@@ -9,6 +10,8 @@ import winsound
 import ctypes
 import re
 import shutil
+import io
+import wave
 from datetime import datetime
 
 import win32gui
@@ -108,7 +111,14 @@ class SDRScout:
         self.selected_station_idx = 0
         self.selected_freq_obj = self.frequencies[0] if self.frequencies else None
         
-        # Audio Logger State (Key [5])
+        # AI Comms Scout & Audio Logger State (Key [5])
+        self.ai_comms_active = False
+        self.ai_silent_mode = True   # True = Comms Silent Mode (Muted speakers, HUD print); False = Audio + HUD
+        self.ai_proc = None
+        self.ai_thread = None
+        self.whisper_model = None
+        self.whisper_loading = False
+        self.comms_transcript_lines = []
         self.audio_logger_active = False
         self.logger_proc = None
         self.logger_file = ""
@@ -198,7 +208,7 @@ class SDRScout:
         while self.running:
             time.sleep(8.0)
             # Only poll when completely idle
-            if not self.is_busy and not self.live_audio_active and not self.audio_logger_active and not self.tcp_process:
+            if not self.is_busy and not self.live_audio_active and not self.ai_comms_active and not self.audio_logger_active and not self.tcp_process:
                 try:
                     self.measure_band_power()
                 except Exception:
@@ -260,6 +270,12 @@ class SDRScout:
             n_target = self.active_tune_name
             self.stop_live_tune()
             self.toggle_live_tune(custom_freq=f_target, custom_name=n_target)
+        elif self.ai_comms_active:
+            # Re-tune AI Comms engine with new hardware gain
+            f_target = self.active_tune_freq
+            n_target = self.active_tune_name
+            self.stop_ai_comms()
+            self.start_ai_comms(custom_freq=f_target, custom_name=n_target)
 
     # Test 1: Hardware & Gain Audit + Power Check
     def run_hardware_audit(self):
@@ -424,50 +440,240 @@ class SDRScout:
         finally:
             self.is_busy = False
 
-    # Key [5]: Audio Logger Hook
-    def toggle_audio_logger(self):
-        if self.audio_logger_active:
-            # Stop logger
-            if self.logger_proc:
-                try:
-                    self.logger_proc.kill()
-                    self.logger_proc = None
-                except Exception:
-                    pass
-            self.audio_logger_active = False
-            self.is_busy = False
+    # Key [5]: AI Comms Scout (Real-time SIGINT & Faster-Whisper Logger)
+    def toggle_ai_comms(self, custom_freq=None, custom_name=None):
+        if self.ai_comms_active:
+            self.stop_ai_comms()
             play_chime("rec_stop")
             self.diagnostic_analysis = [
-                "[bold yellow]AUDIO LOGGER STOPPED.[/bold yellow]",
-                f"[bold white]RECORDING SAVED:[/bold white] {os.path.basename(self.logger_file)}",
-                "[bold cyan]STATUS:[/bold cyan] Channel audio archived to recordings/ folder."
+                "[bold yellow]AI COMMS SCOUT STANDBY.[/bold yellow]",
+                "[bold cyan]STATUS:[/bold cyan] Neural transcriber paused. Tuner free.",
+                "[bold white]CONTROLS:[/bold white] Press [5] to re-engage AI Scout, or [T] for live raw audio."
             ]
         else:
-            if self.live_audio_active:
-                self.stop_live_tune()
-            # Start logger
-            freq = self.selected_freq_obj.get("freq", "147.285") if self.selected_freq_obj else "147.285"
-            freq_hz = str(int(float(freq) * 1000000))
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self.logger_file = os.path.join(RECORDINGS_DIR, f"ares_{freq.replace('.', '_')}MHz_{ts}.raw")
-            
-            exe = self.get_rtl_exe("rtl_fm.exe")
-            try:
-                self.is_busy = True
-                self.logger_proc = subprocess.Popen(
-                    [exe, "-f", freq_hz, "-M", "fm", "-s", "24000", "-r", "24000", self.logger_file],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-                )
-                self.audio_logger_active = True
-                play_chime("rec_start")
+            self.start_ai_comms(custom_freq=custom_freq, custom_name=custom_name)
+
+    def start_ai_comms(self, custom_freq=None, custom_name=None):
+        if self.live_audio_active:
+            self.stop_live_tune()
+        if self.audio_logger_active:
+            self.toggle_audio_logger()
+        if self.tcp_process:
+            self.toggle_rtl_tcp()
+
+        freq = custom_freq if custom_freq else (self.active_tune_freq or (self.selected_freq_obj.get("freq", "147.285") if self.selected_freq_obj else "147.285"))
+        name = custom_name if custom_name else (self.active_tune_name or (self.selected_freq_obj.get("name", "Repeater") if self.selected_freq_obj else "Repeater"))
+        self.active_tune_freq = freq
+        self.active_tune_name = name
+        freq_hz = str(int(float(freq) * 1000000))
+
+        # Guarantee clean tuner ownership
+        subprocess.run(["taskkill", "/F", "/IM", "rtl_power.exe"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(0.15)
+
+        rtl_exe = self.get_rtl_exe("rtl_fm.exe")
+        gain_args = ["-g", str(self.active_gain_db)]
+        # Hardware carrier squelch (-l 45 drops static silence; pipes voice only)
+        squelch_args = ["-l", "45"]
+
+        try:
+            self.is_busy = True
+            self.ai_comms_active = True
+            mode_tag = "SILENT COMMS (HUD TELETYPE)" if self.ai_silent_mode else "LIVE AUDIO + HUD TELETYPE"
+            self.active_test_name = f"AI Scout: {name}"
+            self.hardware_status = f"AI SCOUT: {freq} MHz"
+
+            # Spawn rtl_fm piping 16kHz PCM (Whisper native sample rate)
+            self.ai_proc = subprocess.Popen(
+                [rtl_exe, "-f", freq_hz, "-M", "fm", "-s", "16000", "-r", "16000", "-E", "deemp"] + gain_args + squelch_args + ["-"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+            )
+            time.sleep(0.2)
+            if self.ai_proc.poll() is not None:
+                self.stop_ai_comms()
                 self.diagnostic_analysis = [
-                    f"[bold red]AUDIO LOGGER ENGAGED (REC):[/bold red] Recording {freq} MHz...",
-                    f"[bold cyan]ACTIVE FILE:[/bold cyan] {os.path.basename(self.logger_file)}",
-                    "[bold white]TACTICAL CONTROL:[/bold white] Press [5] again to stop logging and commit audio to disk."
+                    "[bold red]AI COMMS ERROR:[/bold red] rtl_fm failed to claim RTL-SDR tuner.",
+                    "[bold white]ACTION:[/bold white] Press [5] to retry."
                 ]
-            except Exception as e:
-                self.is_busy = False
-                self.diagnostic_analysis = [f"[bold red]LOGGER ERROR:[/bold red] {str(e)}"]
+                return
+
+            self.ai_thread = threading.Thread(target=self._ai_comms_worker, args=(freq, name), daemon=True)
+            self.ai_thread.start()
+            play_chime("rec_start")
+
+            self.diagnostic_analysis = [
+                f"[bold cyan]AI COMMS SCOUT ACTIVE:[/bold cyan] {name} ({freq} MHz).",
+                f"[bold #00d4ff]OPERATIONAL MODE:[/bold #00d4ff] {mode_tag} [Press M to toggle Audio].",
+                "[bold #ff8c00]SIGINT PIPELINE:[/bold #ff8c00] Hardware Squelch -> Faster-Whisper (CUDA RTX 3050) -> Teletype."
+            ]
+        except Exception as e:
+            self.stop_ai_comms()
+            self.diagnostic_analysis = [f"[bold red]AI COMMS START ERROR:[/bold red] {str(e)}"]
+
+    def stop_ai_comms(self):
+        if self.ai_proc:
+            try:
+                self.ai_proc.terminate()
+                self.ai_proc.kill()
+            except Exception:
+                pass
+            self.ai_proc = None
+        self.ai_comms_active = False
+        self.hardware_status = "READY"
+        self.is_busy = False
+
+    def toggle_ai_silent_mode(self):
+        self.ai_silent_mode = not self.ai_silent_mode
+        play_chime("click")
+        mode_str = "SILENT MODE (Speakers muted, Teletype HUD)" if self.ai_silent_mode else "AUDIO ACTIVE (Live speakers + Teletype HUD)"
+        self.diagnostic_analysis = [
+            f"[bold #00d4ff]AI COMMS AUDIO TOGGLE:[/bold #00d4ff] {mode_str}.",
+            f"[bold cyan]STATION LOCKED:[/bold cyan] {self.active_tune_name or 'Repeater'} ({self.active_tune_freq or '147.285'} MHz).",
+            "[bold white]KEYBOARD:[/bold white] Press [M] anytime to switch between Silent Mode and Live Audio."
+        ]
+
+    def _ensure_whisper_loaded(self):
+        if self.whisper_model is not None:
+            return True
+        if self.whisper_loading:
+            return False
+        self.whisper_loading = True
+        try:
+            from faster_whisper import WhisperModel
+            # Load tiny.en on RTX 3050 Laptop GPU with float16 acceleration (~250MB VRAM)
+            self.whisper_model = WhisperModel("tiny.en", device="cuda", compute_type="float16")
+            self.whisper_loading = False
+            return True
+        except Exception:
+            try:
+                # Fallback to int8 if float16 unsupported
+                from faster_whisper import WhisperModel
+                self.whisper_model = WhisperModel("tiny.en", device="cuda", compute_type="int8")
+                self.whisper_loading = False
+                return True
+            except Exception:
+                self.whisper_loading = False
+                return False
+
+    def _ai_comms_worker(self, freq, name):
+        # Background worker for loading model and processing raw PCM chunks from rtl_fm
+        self._ensure_whisper_loaded()
+
+        CHUNK_SIZE = 16000 * 2 * 3  # 3 seconds of 16kHz 16-bit mono PCM = 96,000 bytes
+        buffer = bytearray()
+        last_transcribe_time = time.time()
+
+        ffplay_stream = None
+        if not self.ai_silent_mode:
+            try:
+                ffplay_exe = self.get_ffplay_exe()
+                ffplay_stream = subprocess.Popen(
+                    [ffplay_exe, "-nodisp", "-f", "s16le", "-ar", "16000", "-ch_layout", "mono", "-i", "-"],
+                    stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+            except Exception:
+                ffplay_stream = None
+
+        while self.ai_comms_active and self.ai_proc and self.ai_proc.poll() is None:
+            try:
+                raw_bytes = self.ai_proc.stdout.read(4096)
+                if not raw_bytes:
+                    time.sleep(0.05)
+                    continue
+
+                buffer.extend(raw_bytes)
+
+                # Route to local speaker if not in silent mode
+                if not self.ai_silent_mode and ffplay_stream and ffplay_stream.stdin:
+                    try:
+                        ffplay_stream.stdin.write(raw_bytes)
+                    except Exception:
+                        pass
+
+                # If we've buffered >= 3 seconds or silence pause > 1.2s with >= 1s of audio
+                now = time.time()
+                elapsed = now - last_transcribe_time
+                if len(buffer) >= CHUNK_SIZE or (len(buffer) >= 32000 and elapsed >= 2.5):
+                    chunk_to_process = bytes(buffer)
+                    buffer.clear()
+                    last_transcribe_time = now
+                    threading.Thread(target=self._ai_transcribe_chunk, args=(chunk_to_process, freq, name), daemon=True).start()
+
+            except Exception:
+                break
+
+        if ffplay_stream:
+            try:
+                ffplay_stream.terminate()
+                ffplay_stream.kill()
+            except Exception:
+                pass
+
+    def _ai_transcribe_chunk(self, pcm_bytes, freq, name):
+        if not self._ensure_whisper_loaded():
+            return
+
+        try:
+            # Package 16kHz 16-bit PCM into in-memory WAV container
+            wav_io = io.BytesIO()
+            with wave.open(wav_io, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(16000)
+                wf.writeframes(pcm_bytes)
+            wav_io.seek(0)
+
+            segments, _ = self.whisper_model.transcribe(
+                wav_io,
+                language="en",
+                beam_size=1,
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=400)
+            )
+
+            text_parts = [s.text.strip() for s in segments if s.text and s.text.strip()]
+            full_text = " ".join(text_parts).strip()
+            if not full_text:
+                return
+
+            t_stamp = datetime.now().strftime("%H:%M:%S")
+            formatted_line = self._format_ai_line(t_stamp, freq, name, full_text)
+            self.comms_transcript_lines.append(formatted_line)
+            if len(self.comms_transcript_lines) > 20:
+                self.comms_transcript_lines.pop(0)
+
+            # Also mirror to raw output lines for HUD teletype display
+            self.raw_output_lines.append(formatted_line)
+            if len(self.raw_output_lines) > 20:
+                self.raw_output_lines.pop(0)
+
+            # Commit to disk intel log
+            try:
+                log_file = os.path.join(RECORDINGS_DIR, "comms_intel.log")
+                clean_txt = re.sub(r'\[.*?\]', '', formatted_line)
+                with open(log_file, "a", encoding="utf-8") as lf:
+                    lf.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {clean_txt}\n")
+            except Exception:
+                pass
+
+            play_chime("click")
+        except Exception:
+            pass
+
+    def _format_ai_line(self, t_stamp, freq, name, text):
+        # Highlight Callsigns (e.g. W5LUC, KD4ABC, N5XYZ, KEC61)
+        call_pattern = re.compile(r'\b([AKNW][A-Z]?[0-9][A-Z]{1,3}|KEC[0-9]{2})\b', re.IGNORECASE)
+        highlighted = call_pattern.sub(r'[bold yellow]\1[/bold yellow]', text)
+
+        # Highlight Tactical / Weather Alerts in red
+        alert_pattern = re.compile(r'\b(emergency|warning|tornado|thunderstorm|flash flood|watch|priority|net control)\b', re.IGNORECASE)
+        highlighted = alert_pattern.sub(r'[bold red blink]\1[/bold red blink]', highlighted)
+
+        return f"[dim white][{t_stamp}][/dim white] [bold cyan]{name[:12]}:[/bold cyan] {highlighted}"
+
+    # Legacy key hook fallback
+    def toggle_audio_logger(self):
+        self.toggle_ai_comms()
 
     # Key [T]: Toggle Live Audio Stream (rtl_fm -> ffplay)
     def toggle_live_tune(self, custom_freq=None, custom_name=None):
@@ -540,6 +746,8 @@ class SDRScout:
                 self.diagnostic_analysis = [f"[bold red]AUDIO STREAM ERROR:[/bold red] {str(e)}"]
 
     def stop_live_tune(self):
+        if self.ai_comms_active:
+            self.stop_ai_comms()
         if self.live_tune_ffplay_proc:
             try:
                 self.live_tune_ffplay_proc.terminate()
@@ -716,8 +924,12 @@ class SDRScout:
         else:
             hdr.append(f"[GAIN: {self.active_gain_db:.1f} dB]  ", style="bold #ffa500")
 
-        # Live Audio Streaming badge
-        if self.live_audio_active:
+        # AI Comms SIGINT Badge (Popping Cyan/Neon Blue)
+        if self.ai_comms_active:
+            freq_str = self.active_tune_freq or (self.selected_freq_obj.get("freq", "") if self.selected_freq_obj else "")
+            mode_badge = "SILENT" if self.ai_silent_mode else "AUDIO ON"
+            hdr.append(f"[bold #00ffff blink]AI COMMS HOT[/bold #00ffff blink] [bold #00d4ff]({mode_badge}: {freq_str} MHz)[/bold #00d4ff]  ")
+        elif self.live_audio_active:
             freq_str = self.active_tune_freq or (self.selected_freq_obj.get("freq", "") if self.selected_freq_obj else "")
             hdr.append(f"[LIVE AUDIO: {freq_str} MHz]  ", style="bold red blink")
 
@@ -758,11 +970,25 @@ class SDRScout:
         raw_layout["meters_box"].update(Panel(meters_text, title="Live RF Energy & Tuner Gain Gauges", border_style="#ff8c00"))
 
         raw_text = Text()
-        for r_line in self.raw_output_lines[-6:]:
-            raw_text.append(f"{r_line}\n", style="dim white")
-        if not self.raw_output_lines:
-            raw_text.append("Awaiting diagnostic execution...", style="dim")
-        raw_layout["stream_box"].update(Panel(raw_text, title="Hardware Telemetry Stream", border_style="blue"))
+        # If AI Comms is active, display real-time intercepted speech teletype
+        if self.ai_comms_active and self.comms_transcript_lines:
+            for c_line in self.comms_transcript_lines[-6:]:
+                try:
+                    raw_text.append_text(Text.from_markup(f"{c_line}\n"))
+                except Exception:
+                    raw_text.append(f"{c_line}\n")
+        else:
+            for r_line in self.raw_output_lines[-6:]:
+                try:
+                    raw_text.append_text(Text.from_markup(f"{r_line}\n"))
+                except Exception:
+                    raw_text.append(f"{r_line}\n", style="dim white")
+            if not self.raw_output_lines:
+                raw_text.append("Awaiting diagnostic execution or AI Comms speech...", style="dim")
+
+        stream_title = "AI Comms Teletype Stream" if self.ai_comms_active else "Hardware Telemetry Stream"
+        stream_border = "#00ffff" if self.ai_comms_active else "blue"
+        raw_layout["stream_box"].update(Panel(raw_text, title=stream_title, border_style=stream_border))
 
         left_layout["raw_stream"].update(raw_layout)
         layout["main"]["left_panel"].update(left_layout)
@@ -789,7 +1015,10 @@ class SDRScout:
             )
 
         right_panel_title = "Lucedale & George Co ARES Matrix"
-        if self.live_audio_active:
+        if self.ai_comms_active:
+            mode_lbl = "SILENT" if self.ai_silent_mode else "AUDIO"
+            right_panel_title += f" [bold #00ffff blink][AI HOT: {mode_lbl}][/bold #00ffff blink]"
+        elif self.live_audio_active:
             right_panel_title += " [bold red blink][AUDIO LIVE ON][/bold red blink]"
         elif self.audio_logger_active:
             right_panel_title += " [bold red][REC: AUDIO LOGGER ACTIVE][/bold red]"
@@ -799,6 +1028,16 @@ class SDRScout:
         # Footer Menu
         ft = Text(" GAIN: ", style="bold #ff8c00")
         ft.append("[+/-] ", style="bold #ff8c00"); ft.append(f"{self.active_gain_db:.1f}dB  ", style="bold #ffa500")
+        
+        # Audio / Silent Mute
+        ft.append("| COMMS: ", style="bold cyan")
+        if self.ai_comms_active:
+            ft.append("[5] ", style="bold #00ffff"); ft.append("AI STOP  ", style="bold #00ffff blink")
+            m_state = "Unmute" if self.ai_silent_mode else "Mute"
+            ft.append("[M] ", style="bold #00d4ff"); ft.append(f"{m_state}  ", style="white")
+        else:
+            ft.append("[5] ", style="bold #00ffff"); ft.append("AI Scout  ", style="white")
+
         ft.append("| AUDIO: ", style="bold green")
         if self.live_audio_active:
             ft.append("[T] ", style="bold red"); ft.append("MUTE AUDIO  ", style="bold red blink")
@@ -809,19 +1048,13 @@ class SDRScout:
         
         sq_label = "Squelched" if self.squelch_active else "Open Static"
         ft.append("[O] ", style="bold cyan"); ft.append(f"{sq_label}  ", style="white")
-        ft.append("[S] ", style="bold cyan"); ft.append("Scan Hot  ", style="white")
+        ft.append("[S] ", style="bold cyan"); ft.append("Scan  ", style="white")
         
         ft.append("| MATRIX: ", style="bold yellow")
         ft.append("[1] ", style="bold green"); ft.append("Audit ", style="white")
         ft.append("[2] ", style="bold cyan"); ft.append("Drift ", style="white")
         ft.append("[3] ", style="bold yellow"); ft.append("NOAA ", style="white")
         ft.append("[4] ", style="bold magenta"); ft.append("ADS-B ", style="white")
-        
-        # Audio Logger Key 5
-        if self.audio_logger_active:
-            ft.append("[5] ", style="bold red"); ft.append("STOP REC ", style="bold red blink")
-        else:
-            ft.append("[5] ", style="bold red"); ft.append("Rec ", style="white")
 
         ft.append("[6] ", style="bold blue"); ft.append("TCP ", style="white")
         ft.append("[7] ", style="bold green"); ft.append("Console ", style="white")
@@ -847,6 +1080,7 @@ class SDRScout:
                         ch = raw.decode("utf-8", errors="ignore").lower()
                         if ch == "q":
                             self.stop_live_tune()
+                            self.stop_ai_comms()
                             if self.tcp_process:
                                 self.tcp_process.terminate()
                             if self.logger_proc:
@@ -867,6 +1101,8 @@ class SDRScout:
                             self.tune_noaa_live()
                         elif ch == "o":
                             self.toggle_squelch()
+                        elif ch == "m":
+                            self.toggle_ai_silent_mode()
                         elif ch == "s":
                             threading.Thread(target=self.run_ares_scan, daemon=True).start()
                         elif ch == "1":
@@ -878,7 +1114,7 @@ class SDRScout:
                         elif ch == "4":
                             threading.Thread(target=self.run_adsb_scout, daemon=True).start()
                         elif ch == "5":
-                            threading.Thread(target=self.toggle_audio_logger, daemon=True).start()
+                            threading.Thread(target=self.toggle_ai_comms, daemon=True).start()
                         elif ch == "6":
                             threading.Thread(target=self.toggle_rtl_tcp, daemon=True).start()
                         elif ch == "7":

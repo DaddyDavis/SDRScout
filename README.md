@@ -20,7 +20,8 @@ SDRScout is a 1-click tactical terminal HUD and signal diagnostic engine built f
 | `[2]` | PPM Thermal Drift | Benchmarks crystal oscillator error over time, confirming 0.5 PPM TCXO frequency stability. |
 | `[3]` | NOAA Weather Radio Check | Tunes to 162.550 MHz (Mobile/Gulf Coast) to verify RF front-end and antenna matching. |
 | `[4]` | ADS-B Aircraft Scout | Intercepts commercial Mode-S aircraft transponder frames on 1090 MHz. |
-| `[5]` | Audio Logger (REC Toggle) | Records active repeater/ARES channel audio to timestamped `.raw` audio in `recordings/`. |
+| `[5]` | AI Comms Scout (SIGINT Toggle) | Feeds squelched FM audio into Faster-Whisper (CUDA RTX 3050). Auto-transcribes speech and logs callsigns to HUD teletype. |
+| `[M]` | Comms Silent / Audio Mode | Toggles between **Silent Mode** (muted speakers, live text HUD) and **Audio Active** (speakers + text HUD). |
 | `[6]` | Toggle RTL-TCP Server | Starts or stops a network streaming server (`0.0.0.0:1234`) for SDR++, SDR Console, or Kali. |
 | `[7]` | Launch SDR Console V3 | Opens SDR Console V3 with a single keypress. |
 | `[8]` | Launch SDR++ | Opens SDR++ with a single keypress. |
