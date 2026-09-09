@@ -13,7 +13,16 @@ import shutil
 import io
 import wave
 import sqlite3
+import math
 from datetime import datetime
+
+try:
+    import pyModeS
+except Exception:
+    pyModeS = None
+
+HOME_LAT = 30.9246  # Lucedale, MS
+HOME_LON = -88.5886
 
 import win32gui
 import win32con
@@ -147,10 +156,17 @@ class SDRScout:
         self.logger_proc = None
         self.logger_file = ""
 
-        # View Mode State: "HUD" (default live dashboard) or "LOGS" (SQLite Log Viewer [L])
+        # View Mode State: "HUD" (default live dashboard), "LOGS" (SQLite Log Viewer [L]), or "RADAR" (ADS-B Scope [4])
         self.view_mode = "HUD"
         self.log_selected_idx = 0
         self.log_filter_mode = "ALL"  # "ALL", "CALLSIGNS", "ALERTS"
+
+        # ADS-B 1090 MHz Live Radar State (Key [4])
+        self.adsb_active = False
+        self.adsb_proc = None
+        self.adsb_thread = None
+        self.adsb_aircraft = {}  # icao -> dict(callsign, alt, lat, lon, dist, bearing, speed, heading, seen)
+        self.adsb_selected_idx = 0
 
         # Live Audio Streaming State (Key [T])
         self.live_audio_active = False
@@ -237,7 +253,7 @@ class SDRScout:
         while self.running:
             time.sleep(8.0)
             # Only poll when completely idle
-            if not self.is_busy and not self.live_audio_active and not self.ai_comms_active and not self.audio_logger_active and not self.tcp_process:
+            if not self.is_busy and not self.live_audio_active and not self.ai_comms_active and not self.adsb_active and not self.audio_logger_active and not self.tcp_process:
                 try:
                     self.measure_band_power()
                 except Exception:
@@ -435,39 +451,251 @@ class SDRScout:
         finally:
             self.is_busy = False
 
-    # Test 4: ADS-B Flight Transponder Scout
-    def run_adsb_scout(self):
+    # Key [4]: ADS-B 1090 MHz Real-Time Aircraft Radar Scope & Telemetry
+    def toggle_adsb_radar(self):
+        play_chime("click")
+        if self.adsb_active:
+            self.stop_adsb_radar()
+            self.view_mode = "HUD"
+            self.diagnostic_analysis = [
+                "[bold yellow]ADS-B RADAR SCOPE STOPPED.[/bold yellow]",
+                "[bold cyan]STATUS:[/bold cyan] 1090 MHz receiver released. Dongle returned to standby.",
+                "[bold white]CONTROLS:[/bold white] Press [4] to engage live radar, or [T] to tune VHF repeaters."
+            ]
+        else:
+            self.start_adsb_radar()
+
+    def start_adsb_radar(self):
         if self.live_audio_active:
             self.stop_live_tune()
-        self.is_busy = True
+        if self.ai_comms_active:
+            self.stop_ai_comms()
+        if self.tcp_process:
+            self.toggle_rtl_tcp()
+
+        # Guarantee clean USB tuner ownership
+        subprocess.run(["taskkill", "/F", "/IM", "rtl_power.exe"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(0.15)
+
+        exe = self.get_rtl_exe("rtl_adsb.exe")
         try:
-            self.active_test_name = "ADS-B Aircraft Scout (1090 MHz)"
-            self.hardware_status = "INTERCEPTING"
-            self.raw_output_lines = ["Listening on 1090 MHz for Gulf Coast airspace transponders..."]
+            self.is_busy = True
+            self.adsb_active = True
+            self.view_mode = "RADAR"
+            self.active_test_name = "ADS-B Tactical Radar Scope (1090 MHz)"
+            self.hardware_status = "RADAR SCOPE: 1090 MHz"
 
-            exe = self.get_rtl_exe("rtl_adsb.exe")
-            full_text = run_rtl_cmd_timeout([exe], 4.5)
+            # rtl_adsb outputs raw Mode-S frames in real-time
+            self.adsb_proc = subprocess.Popen([exe], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+            self.adsb_thread = threading.Thread(target=self._adsb_worker, daemon=True)
+            self.adsb_thread.start()
+            play_chime("success")
 
-            self.last_test_time = time.strftime("%I:%M:%S %p")
-            frames = [l.strip() for l in full_text.splitlines() if l.strip().startswith("*")]
-            self.raw_output_lines = [l.strip()[:65] for l in full_text.splitlines() if l.strip()][-8:]
+            self.diagnostic_analysis = [
+                "[bold green]ADS-B AIRSPACE RADAR ACTIVE:[/bold green] Sweeping 1090 MHz for Gulf Coast transponders.",
+                f"[bold cyan]RADAR ORIGIN:[/bold cyan] Lucedale / George County, MS ({HOME_LAT:.4f}, {HOME_LON:.4f}).",
+                "[bold yellow]1-KEY ACTION:[/bold yellow] Press [4] or [Esc] to exit radar and return to repeater HUD."
+            ]
+        except Exception as e:
+            self.stop_adsb_radar()
+            self.diagnostic_analysis = [f"[bold red]RADAR LAUNCH ERROR:[/bold red] {str(e)}"]
 
-            analysis = []
-            if frames:
-                self.hardware_status = f"INTERCEPTED {len(frames)} PINGS"
-                play_chime("success")
-                analysis.append(f"[bold green]AIRSPACE INTERCEPT ACTIVE:[/bold green] Decoded {len(frames)} raw Mode-S aircraft frames.")
-                analysis.append(f"[bold cyan]LATEST PACKET:[/bold cyan] {frames[-1]}")
-                analysis.append("[bold white]TACTICAL ADVICE:[/bold white] 1090 MHz UHF performance confirmed. Antenna is pulling commercial air traffic over the Gulf Coast.")
-            else:
-                self.hardware_status = "ZERO FRAMES"
-                play_chime("alert")
-                analysis.append("[bold yellow]ZERO AIRCRAFT INTERCEPTS:[/bold yellow] No 1090 MHz frames received in window.")
-                analysis.append("[bold white]TACTICAL ADVICE:[/bold white] If indoor antenna is shielded, reposition near a window or check line of sight.")
+    def stop_adsb_radar(self):
+        if self.adsb_proc:
+            try:
+                self.adsb_proc.terminate()
+                self.adsb_proc.kill()
+            except Exception:
+                pass
+            self.adsb_proc = None
+        self.adsb_active = False
+        self.hardware_status = "READY"
+        self.is_busy = False
 
-            self.diagnostic_analysis = analysis
-        finally:
-            self.is_busy = False
+    def _adsb_worker(self):
+        while self.adsb_active and self.adsb_proc and self.adsb_proc.poll() is None:
+            try:
+                line = self.adsb_proc.stdout.readline()
+                if not line:
+                    time.sleep(0.02)
+                    continue
+
+                line = line.strip()
+                if not line.startswith("*") or not line.endswith(";"):
+                    continue
+
+                hex_msg = line[1:-1]
+                if len(hex_msg) < 14:
+                    continue
+
+                now = time.time()
+                # Decode Mode-S frame
+                if pyModeS:
+                    try:
+                        res = pyModeS.decode(hex_msg)
+                        if res and "icao" in res and res.get("crc_valid", True):
+                            icao = res["icao"].upper()
+                            if icao not in self.adsb_aircraft:
+                                self.adsb_aircraft[icao] = {
+                                    "icao": icao,
+                                    "callsign": "---",
+                                    "alt": "---",
+                                    "lat": None,
+                                    "lon": None,
+                                    "dist": None,
+                                    "bearing": None,
+                                    "speed": "---",
+                                    "heading": "---",
+                                    "seen": now
+                                }
+                            ac = self.adsb_aircraft[icao]
+                            ac["seen"] = now
+
+                            if "callsign" in res and res["callsign"]:
+                                ac["callsign"] = res["callsign"].strip()
+                            if "altitude" in res and res["altitude"]:
+                                ac["alt"] = f"{int(res['altitude']):,} ft"
+                            if "ground_speed" in res and res["ground_speed"]:
+                                ac["speed"] = f"{int(res['ground_speed'])} kt"
+                            if "track" in res and res["track"]:
+                                ac["heading"] = f"{int(res['track']):03d}°"
+
+                            # Decode Coordinates if position message
+                            if "lat" in res and "lon" in res and res["lat"] is not None and res["lon"] is not None:
+                                lat = res["lat"]
+                                lon = res["lon"]
+                                ac["lat"] = lat
+                                ac["lon"] = lon
+                                dist_mi, brg_deg = self.calculate_bearing_distance(HOME_LAT, HOME_LON, lat, lon)
+                                ac["dist"] = dist_mi
+                                ac["bearing"] = brg_deg
+                    except Exception:
+                        pass
+                else:
+                    # Fallback raw hex extractor
+                    icao = hex_msg[2:8].upper()
+                    if icao not in self.adsb_aircraft:
+                        self.adsb_aircraft[icao] = {
+                            "icao": icao, "callsign": "---", "alt": "---", "lat": None, "lon": None,
+                            "dist": None, "bearing": None, "speed": "---", "heading": "---", "seen": now
+                        }
+                    self.adsb_aircraft[icao]["seen"] = now
+
+                # Evict aircraft not heard from in 60 seconds
+                stale_threshold = now - 60.0
+                stale_keys = [k for k, v in self.adsb_aircraft.items() if v["seen"] < stale_threshold]
+                for k in stale_keys:
+                    del self.adsb_aircraft[k]
+
+            except Exception:
+                break
+
+    def calculate_bearing_distance(self, lat1, lon1, lat2, lon2):
+        R = 3958.8  # Earth radius in miles
+        phi1, phi2 = math.radians(lat1), math.radians(lat2)
+        dphi = math.radians(lat2 - lat1)
+        dlam = math.radians(lon2 - lon1)
+        a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlam/2)**2
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+        dist_miles = R * c
+
+        y = math.sin(dlam) * math.cos(phi2)
+        x = math.cos(phi1)*math.sin(phi2) - math.sin(phi1)*math.cos(phi2)*math.cos(dlam)
+        bearing = (math.degrees(math.atan2(y, x)) + 360) % 360
+        return round(dist_miles, 1), round(bearing, 0)
+
+    def render_ascii_radar_scope(self, width=27, height=15, max_range_mi=100.0):
+        grid = [[" " for _ in range(width)] for _ in range(height)]
+        cx = width // 2
+        cy = height // 2
+
+        # Draw concentric range rings (outer ~100mi, inner ~50mi)
+        for y in range(height):
+            for x in range(width):
+                dx = (x - cx) * 1.95  # aspect ratio correction for terminal chars
+                dy = (y - cy)
+                dist = math.sqrt(dx*dx + dy*dy)
+                if 2.8 <= dist <= 3.8:
+                    grid[y][x] = "."
+                elif 6.5 <= dist <= 7.5:
+                    grid[y][x] = ":"
+
+        # Mark Home location: Lucedale, MS
+        grid[cy][cx] = "[bold green]+[/bold green]"
+
+        # Plot active aircraft blips
+        blip_count = 0
+        for icao, ac in self.adsb_aircraft.items():
+            dist = ac.get("dist")
+            bearing = ac.get("bearing")
+            if dist is not None and bearing is not None and dist <= max_range_mi:
+                rad = math.radians(bearing)
+                norm_r = (dist / max_range_mi) * (height // 2)
+                px = int(cx + (norm_r * math.sin(rad) * 1.95))
+                py = int(cy - (norm_r * math.cos(rad)))
+                if 0 <= py < height and 0 <= px < width:
+                    call_label = ac.get("callsign", "").strip() or ac.get("icao", "")[:3]
+                    # Direct blip symbol with flight vector indicator
+                    grid[py][px] = f"[bold #00ffff blink]▲[/bold #00ffff blink]"
+                    blip_count += 1
+
+        scope_text = Text()
+        scope_text.append(f"   NORTH (360°)   [100 MI RANGE]\n", style="bold #00ffff")
+        for row in grid:
+            scope_line = "".join(row)
+            try:
+                scope_text.append_text(Text.from_markup(f"  {scope_line}\n"))
+            except Exception:
+                scope_text.append(f"  {scope_line}\n", style="dim green")
+        scope_text.append(f"  SOUTH (180°)   [+ LUCEDALE, MS]\n", style="bold #00ffff")
+        return scope_text
+
+    def build_radar_panel(self):
+        layout = Layout()
+        layout.split_row(
+            Layout(name="radar_scope", ratio=1),
+            Layout(name="radar_table", ratio=1)
+        )
+
+        # Left Column: ASCII Radar Scope
+        scope_text = self.render_ascii_radar_scope()
+        layout["radar_scope"].update(Panel(scope_text, title="Tactical Airspace PPI Scope (1090 MHz)", border_style="#00ffff"))
+
+        # Right Column: Active Aircraft Telemetry Table
+        t = Table(expand=True, box=None, show_header=True)
+        t.add_column("ICAO", style="bold cyan", width=7)
+        t.add_column("Flight", style="bold yellow", width=9)
+        t.add_column("Alt", style="bold green", width=10)
+        t.add_column("Dist", style="bold #00ffff", width=8)
+        t.add_column("Brg", style="white", width=6)
+        t.add_column("Speed", style="dim white", width=8)
+        t.add_column("Hdg", style="dim yellow", width=6)
+
+        sorted_ac = sorted(
+            self.adsb_aircraft.values(),
+            key=lambda a: (a.get("dist") is None, a.get("dist") or 9999)
+        )
+
+        if not sorted_ac:
+            t.add_row("---", "NO TRAFFIC", "---", "---", "---", "---", "---")
+        else:
+            for ac in sorted_ac[:14]:
+                dist_str = f"{ac['dist']} mi" if ac.get("dist") is not None else "[dim]calc...[/dim]"
+                brg_str = f"{int(ac['bearing']):03d}°" if ac.get("bearing") is not None else "[dim]-[/dim]"
+                t.add_row(
+                    ac.get("icao", "---"),
+                    ac.get("callsign", "---"),
+                    str(ac.get("alt", "---")),
+                    dist_str,
+                    brg_str,
+                    str(ac.get("speed", "---")),
+                    str(ac.get("heading", "---"))
+                )
+
+        table_title = f"Gulf Coast Airspace Contacts ({len(sorted_ac)} Active)"
+        layout["radar_table"].update(Panel(t, title=table_title, border_style="yellow"))
+
+        return layout
 
     # Key [5]: AI Comms Scout (Real-time SIGINT & Faster-Whisper Logger)
     def toggle_ai_comms(self, custom_freq=None, custom_name=None):
@@ -1068,7 +1296,10 @@ class SDRScout:
             hdr.append(f"[GAIN: {self.active_gain_db:.1f}dB] ", style="bold #ffa500")
 
         # AI Comms SIGINT Badge (Popping Cyan/Neon Blue)
-        if self.ai_comms_active:
+        if self.adsb_active:
+            hdr.append("[ADS-B RADAR ACTIVE] ", style="bold #00ffff blink")
+            hdr.append(f"(1090 MHz: {len(self.adsb_aircraft)} Contacts) ", style="bold #00d4ff")
+        elif self.ai_comms_active:
             freq_str = self.active_tune_freq or (self.selected_freq_obj.get("freq", "") if self.selected_freq_obj else "")
             mode_badge = "SILENT" if self.ai_silent_mode else "AUDIO"
             hdr.append("[AI COMMS HOT] ", style="bold #00ffff blink")
@@ -1081,7 +1312,19 @@ class SDRScout:
         hdr.append(f"[PULSE: {pulse_char} {now_time}]", style="bold cyan")
         layout["header"].update(Panel(hdr, style="green on #030508", border_style="green"))
 
-        # Mode Branch: If in LOGS mode, render SQLite Ghost Intelligence Logbook
+        # Mode Branch 1: If in RADAR mode, render tactical mini PPI radar scope & telemetry table
+        if self.view_mode == "RADAR":
+            layout["main"].update(self.build_radar_panel())
+
+            # Tactical Radar Footer Menu
+            ft = Text(" ADS-B RADAR: ", style="bold #00ffff")
+            ft.append("[4 / Esc] ", style="bold #00ffff blink"); ft.append("Return to VHF Repeater HUD  ", style="white")
+            ft.append("[+/-] ", style="bold #ff8c00"); ft.append(f"Gain ({self.active_gain_db:.1f}dB)  ", style="bold #ffa500")
+            ft.append("[Q] ", style="bold red"); ft.append("Quit", style="white")
+            layout["footer"].update(Panel(ft, style="white on #030508", border_style="#00ffff"))
+            return layout
+
+        # Mode Branch 2: If in LOGS mode, render SQLite Ghost Intelligence Logbook
         if self.view_mode == "LOGS":
             layout["main"].update(self.build_log_viewer_panel())
             
@@ -1214,7 +1457,10 @@ class SDRScout:
         ft.append("[1] ", style="bold green"); ft.append("Audit ", style="white")
         ft.append("[2] ", style="bold cyan"); ft.append("Drift ", style="white")
         ft.append("[3] ", style="bold yellow"); ft.append("NOAA ", style="white")
-        ft.append("[4] ", style="bold magenta"); ft.append("ADS-B ", style="white")
+        if self.adsb_active:
+            ft.append("[4] ", style="bold #00ffff"); ft.append("RADAR  ", style="bold #00ffff blink")
+        else:
+            ft.append("[4] ", style="bold #00ffff"); ft.append("Radar ", style="white")
 
         ft.append("[6] ", style="bold blue"); ft.append("TCP ", style="white")
         ft.append("[7] ", style="bold green"); ft.append("Console ", style="white")
@@ -1248,6 +1494,7 @@ class SDRScout:
                         if ch == "q":
                             self.stop_live_tune()
                             self.stop_ai_comms()
+                            self.stop_adsb_radar()
                             if self.tcp_process:
                                 self.tcp_process.terminate()
                             if self.logger_proc:
@@ -1255,8 +1502,18 @@ class SDRScout:
                             self.running = False
                             break
 
+                        # Mode Navigation: [Esc] or Mode Hotkeys
+                        elif raw == b'\x1b':  # [Esc] returns to HUD from any sub-mode
+                            if self.view_mode == "RADAR":
+                                self.toggle_adsb_radar()
+                            elif self.view_mode == "LOGS":
+                                self.toggle_view_mode()
+
+                        elif ch == "4":  # [4] Toggle Live ADS-B Radar Scope
+                            self.toggle_adsb_radar()
+
                         # Log Viewer Controls
-                        elif ch == "l" or raw == b'\x1b':  # [L] or [Esc]
+                        elif ch == "l":  # [L]
                             self.toggle_view_mode()
                         elif self.view_mode == "LOGS":
                             if ch in ("n", "j"):
@@ -1267,6 +1524,13 @@ class SDRScout:
                                 self.cycle_log_filter()
                             elif ch in ("c", " "):
                                 self.copy_selected_log_row()
+
+                        # Radar Scope Controls (Active when in RADAR mode)
+                        elif self.view_mode == "RADAR":
+                            if ch in ("+", "=", "]"):
+                                self.adjust_gain(1)
+                            elif ch in ("-", "_", "["):
+                                self.adjust_gain(-1)
 
                         # Main HUD Controls (Only active when in HUD mode)
                         elif ch in ("+", "=", "]"):
@@ -1293,8 +1557,6 @@ class SDRScout:
                             threading.Thread(target=self.run_ppm_calibration, daemon=True).start()
                         elif ch == "3":
                             threading.Thread(target=self.run_noaa_check, daemon=True).start()
-                        elif ch == "4":
-                            threading.Thread(target=self.run_adsb_scout, daemon=True).start()
                         elif ch == "5":
                             threading.Thread(target=self.toggle_ai_comms, daemon=True).start()
                         elif ch == "6":

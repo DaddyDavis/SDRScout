@@ -19,7 +19,7 @@ SDRScout is a 1-click tactical terminal HUD and signal diagnostic engine built f
 | `[1]` | Hardware & Gain Audit | Verifies USB throughput at 2.4 MSPS, checks 29 tuner gain steps, tests for dropped samples. |
 | `[2]` | PPM Thermal Drift | Benchmarks crystal oscillator error over time, confirming 0.5 PPM TCXO frequency stability. |
 | `[3]` | NOAA Weather Radio Check | Tunes to 162.550 MHz (Mobile/Gulf Coast) to verify RF front-end and antenna matching. |
-| `[4]` | ADS-B Aircraft Scout | Intercepts commercial Mode-S aircraft transponder frames on 1090 MHz. |
+| `[4]` | ADS-B Airspace Radar Scope | Launches live 1090 MHz Mode-S PPI radar scope with aircraft blips (`▲`) relative to Lucedale, MS (`+`), 50/100 mi range rings, and real-time telemetry table (Callsign, Alt, Heading, Speed, Miles out). Press `[4]` or `[Esc]` to return. |
 | `[5]` | AI Comms Scout (SIGINT Toggle) | Feeds squelched FM audio into Faster-Whisper (CUDA RTX 3050). Auto-transcribes speech and logs callsigns to HUD teletype. |
 | `[M]` | Comms Silent / Audio Mode | Toggles between **Silent Mode** (muted speakers, live text HUD) and **Audio Active** (speakers + text HUD). |
 | `[L]` | SQLite Logbook Viewer | Opens the interactive, zero-typing intercept table (`comms_intel.db`). Scroll with `[Up]`/`[Down]`, cycle filters with `[F]`, copy with `[C]`. |
