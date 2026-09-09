@@ -482,7 +482,7 @@ class SDRScout:
                     return
 
                 self.live_tune_ffplay_proc = subprocess.Popen(
-                    [ffplay_exe, "-nodisp", "-f", "s16le", "-ar", "24000", "-ac", "1", "-i", "-"],
+                    [ffplay_exe, "-nodisp", "-f", "s16le", "-ar", "24000", "-ch_layout", "mono", "-i", "-"],
                     stdin=self.live_tune_rtl_proc.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
                 )
                 self.live_audio_active = True
@@ -674,7 +674,7 @@ class SDRScout:
         # Live Audio Streaming badge
         if self.live_audio_active:
             freq_str = self.selected_freq_obj.get("freq", "") if self.selected_freq_obj else ""
-            hdr.append(f"[LIVE AUDIO: {freq_str} MHz]  ", style="bold green blink")
+            hdr.append(f"[LIVE AUDIO: {freq_str} MHz]  ", style="bold red blink")
 
         # Heartbeat pulse
         hdr.append(f"[PULSE: {pulse_char} {now_time}]", style="bold cyan")
@@ -743,7 +743,7 @@ class SDRScout:
 
         right_panel_title = "Lucedale & George Co ARES Matrix"
         if self.live_audio_active:
-            right_panel_title += " [bold green][AUDIO MONITOR ON][/bold green]"
+            right_panel_title += " [bold red blink][AUDIO LIVE ON][/bold red blink]"
         elif self.audio_logger_active:
             right_panel_title += " [bold red][REC: AUDIO LOGGER ACTIVE][/bold red]"
 
@@ -752,7 +752,7 @@ class SDRScout:
         # Footer Menu
         ft = Text(" AUDIO: ", style="bold green")
         if self.live_audio_active:
-            ft.append("[T] ", style="bold green"); ft.append("MUTE  ", style="bold green blink")
+            ft.append("[T] ", style="bold red"); ft.append("MUTE AUDIO  ", style="bold red blink")
         else:
             ft.append("[T] ", style="bold green"); ft.append("Tune Live  ", style="white")
 
