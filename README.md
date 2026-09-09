@@ -22,6 +22,7 @@ SDRScout is a 1-click tactical terminal HUD and signal diagnostic engine built f
 | `[4]` | ADS-B Aircraft Scout | Intercepts commercial Mode-S aircraft transponder frames on 1090 MHz. |
 | `[5]` | AI Comms Scout (SIGINT Toggle) | Feeds squelched FM audio into Faster-Whisper (CUDA RTX 3050). Auto-transcribes speech and logs callsigns to HUD teletype. |
 | `[M]` | Comms Silent / Audio Mode | Toggles between **Silent Mode** (muted speakers, live text HUD) and **Audio Active** (speakers + text HUD). |
+| `[L]` | SQLite Logbook Viewer | Opens the interactive, zero-typing intercept table (`comms_intel.db`). Scroll with `[Up]`/`[Down]`, cycle filters with `[F]`, copy with `[C]`. |
 | `[6]` | Toggle RTL-TCP Server | Starts or stops a network streaming server (`0.0.0.0:1234`) for SDR++, SDR Console, or Kali. |
 | `[7]` | Launch SDR Console V3 | Opens SDR Console V3 with a single keypress. |
 | `[8]` | Launch SDR++ | Opens SDR++ with a single keypress. |

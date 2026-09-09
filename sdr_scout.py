@@ -12,6 +12,7 @@ import re
 import shutil
 import io
 import wave
+import sqlite3
 from datetime import datetime
 
 import win32gui
@@ -33,10 +34,33 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FREQ_PATH = os.path.join(BASE_DIR, "frequencies.json")
 ICO_PATH = os.path.join(BASE_DIR, "sdr_scout.ico")
 RECORDINGS_DIR = os.path.join(BASE_DIR, "recordings")
+DB_PATH = os.path.join(RECORDINGS_DIR, "comms_intel.db")
 RTL_DIR = r"C:\Tools\rtl-sdr"
 
 os.makedirs(RECORDINGS_DIR, exist_ok=True)
 console = Console()
+
+def init_comms_db():
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS intercepts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                freq_mhz TEXT NOT NULL,
+                station_name TEXT NOT NULL,
+                callsigns TEXT,
+                alert_tags TEXT,
+                transcript TEXT NOT NULL
+            )
+        """)
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+init_comms_db()
 
 # Inject Windows Taskbar AppUserModelID and window icon
 try:
@@ -122,6 +146,11 @@ class SDRScout:
         self.audio_logger_active = False
         self.logger_proc = None
         self.logger_file = ""
+
+        # View Mode State: "HUD" (default live dashboard) or "LOGS" (SQLite Log Viewer [L])
+        self.view_mode = "HUD"
+        self.log_selected_idx = 0
+        self.log_filter_mode = "ALL"  # "ALL", "CALLSIGNS", "ALERTS"
 
         # Live Audio Streaming State (Key [T])
         self.live_audio_active = False
@@ -636,23 +665,47 @@ class SDRScout:
             if not full_text:
                 return
 
+            # Extract Callsigns (e.g. W5LUC, KD4ABC, N5XYZ, KEC61)
+            call_pattern = re.compile(r'\b([AKNW][A-Z]?[0-9][A-Z]{1,3}|KEC[0-9]{2})\b', re.IGNORECASE)
+            found_calls = list(dict.fromkeys(call_pattern.findall(full_text)))
+            call_str = ", ".join(found_calls) if found_calls else ""
+
+            # Extract Tactical Alerts
+            alert_pattern = re.compile(r'\b(emergency|warning|tornado|thunderstorm|flash flood|watch|priority|net control)\b', re.IGNORECASE)
+            found_alerts = list(dict.fromkeys(alert_pattern.findall(full_text)))
+            alert_str = ", ".join(found_alerts) if found_alerts else ""
+
             t_stamp = datetime.now().strftime("%H:%M:%S")
+            full_dt_stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             formatted_line = self._format_ai_line(t_stamp, freq, name, full_text)
             self.comms_transcript_lines.append(formatted_line)
-            if len(self.comms_transcript_lines) > 20:
+            if len(self.comms_transcript_lines) > 30:
                 self.comms_transcript_lines.pop(0)
 
             # Also mirror to raw output lines for HUD teletype display
             self.raw_output_lines.append(formatted_line)
-            if len(self.raw_output_lines) > 20:
+            if len(self.raw_output_lines) > 30:
                 self.raw_output_lines.pop(0)
 
-            # Commit to disk intel log
+            # SQLite Ghost Logging: Commit directly to database
+            try:
+                conn = sqlite3.connect(DB_PATH)
+                cur = conn.cursor()
+                cur.execute("""
+                    INSERT INTO intercepts (timestamp, freq_mhz, station_name, callsigns, alert_tags, transcript)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (full_dt_stamp, str(freq), str(name), call_str, alert_str, full_text))
+                conn.commit()
+                conn.close()
+            except Exception:
+                pass
+
+            # Also commit to fallback text log
             try:
                 log_file = os.path.join(RECORDINGS_DIR, "comms_intel.log")
                 clean_txt = re.sub(r'\[.*?\]', '', formatted_line)
                 with open(log_file, "a", encoding="utf-8") as lf:
-                    lf.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {clean_txt}\n")
+                    lf.write(f"[{full_dt_stamp}] {clean_txt}\n")
             except Exception:
                 pass
 
@@ -893,9 +946,99 @@ class SDRScout:
         if os.path.exists(path):
             play_chime("click")
             subprocess.Popen([path], cwd=os.path.dirname(path))
-            self.diagnostic_analysis = ["[bold green]LAUNCHED:[/bold green] SDR++ opened successfully."]
         else:
             self.diagnostic_analysis = ["[bold red]NOT FOUND:[/bold red] sdrpp.exe not found in Documents/Radio_SDR."]
+
+    def fetch_sqlite_intercepts(self, limit=50):
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cur = conn.cursor()
+            if self.log_filter_mode == "CALLSIGNS":
+                cur.execute("SELECT id, timestamp, freq_mhz, station_name, callsigns, alert_tags, transcript FROM intercepts WHERE callsigns != '' ORDER BY id DESC LIMIT ?", (limit,))
+            elif self.log_filter_mode == "ALERTS":
+                cur.execute("SELECT id, timestamp, freq_mhz, station_name, callsigns, alert_tags, transcript FROM intercepts WHERE alert_tags != '' ORDER BY id DESC LIMIT ?", (limit,))
+            else:
+                cur.execute("SELECT id, timestamp, freq_mhz, station_name, callsigns, alert_tags, transcript FROM intercepts ORDER BY id DESC LIMIT ?", (limit,))
+            rows = cur.fetchall()
+            conn.close()
+            return rows
+        except Exception:
+            return []
+
+    def toggle_view_mode(self):
+        play_chime("click")
+        if self.view_mode == "HUD":
+            self.view_mode = "LOGS"
+            self.log_selected_idx = 0
+        else:
+            self.view_mode = "HUD"
+
+    def cycle_log_filter(self):
+        play_chime("click")
+        modes = ["ALL", "CALLSIGNS", "ALERTS"]
+        curr_i = modes.index(self.log_filter_mode) if self.log_filter_mode in modes else 0
+        self.log_filter_mode = modes[(curr_i + 1) % len(modes)]
+        self.log_selected_idx = 0
+
+    def scroll_logs(self, delta):
+        rows = self.fetch_sqlite_intercepts()
+        if not rows:
+            return
+        self.log_selected_idx = max(0, min(len(rows) - 1, self.log_selected_idx + delta))
+        play_chime("click")
+
+    def copy_selected_log_row(self):
+        rows = self.fetch_sqlite_intercepts()
+        if rows and 0 <= self.log_selected_idx < len(rows):
+            row = rows[self.log_selected_idx]
+            # row: id, timestamp, freq_mhz, station_name, callsigns, alert_tags, transcript
+            txt = f"[{row[1]}] {row[3]} ({row[2]} MHz): {row[6]}"
+            copy_to_clipboard(txt)
+            play_chime("success")
+
+    def build_log_viewer_panel(self):
+        rows = self.fetch_sqlite_intercepts()
+        total_count = len(rows)
+
+        # Build Rich Table for intercepted speech
+        t = Table(expand=True, box=None, show_header=True)
+        t.add_column("#", style="bold cyan", width=3)
+        t.add_column("Time", style="dim white", width=9)
+        t.add_column("Station", style="bold green", width=14)
+        t.add_column("Freq", style="cyan", width=8)
+        t.add_column("Callsigns", style="bold yellow", width=12)
+        t.add_column("Alerts", style="bold red", width=10)
+        t.add_column("Intercepted Transcript", style="white")
+
+        if not rows:
+            t.add_row("-", "--:--:--", "NO INTERCEPTS", "---.---", "None", "None", "[dim]No speech detected yet. Turn on [5] AI Comms Scout to automatically log intercepts.[/dim]")
+        else:
+            for idx, r in enumerate(rows[:14]):
+                is_sel = (self.log_selected_idx == idx)
+                marker = ">" if is_sel else " "
+                row_style = "bold white on #1a233a" if is_sel else ""
+
+                r_time = r[1].split()[-1] if " " in r[1] else r[1]
+                st_name = r[3][:14]
+                f_str = r[2]
+                calls = r[4] if r[4] else "[dim]-[/dim]"
+                alerts = f"[bold red blink]{r[5]}[/bold red blink]" if r[5] else "[dim]-[/dim]"
+                trans = r[6]
+
+                t.add_row(
+                    f"{marker}{idx + 1}",
+                    r_time,
+                    st_name,
+                    f_str,
+                    calls,
+                    alerts,
+                    trans,
+                    style=row_style
+                )
+
+        f_tag = f"[FILTER: {self.log_filter_mode}]"
+        title = f"SQLite Ghost Intelligence Logbook ({total_count} records) {f_tag}"
+        return Panel(t, title=title, border_style="#00ffff")
 
     def build_layout(self):
         layout = Layout()
@@ -937,6 +1080,20 @@ class SDRScout:
         # Heartbeat pulse
         hdr.append(f"[PULSE: {pulse_char} {now_time}]", style="bold cyan")
         layout["header"].update(Panel(hdr, style="green on #030508", border_style="green"))
+
+        # Mode Branch: If in LOGS mode, render SQLite Ghost Intelligence Logbook
+        if self.view_mode == "LOGS":
+            layout["main"].update(self.build_log_viewer_panel())
+            
+            # Logs Footer Menu
+            ft = Text(" LOG VIEWER: ", style="bold #00ffff")
+            ft.append("[Up/Down] ", style="bold green"); ft.append("Scroll  ", style="white")
+            ft.append("[F] ", style="bold yellow"); ft.append(f"Filter ({self.log_filter_mode})  ", style="bold yellow")
+            ft.append("[C] ", style="bold cyan"); ft.append("Copy Row  ", style="white")
+            ft.append("[L / Esc] ", style="bold #00ffff blink"); ft.append("Back to Live HUD  ", style="white")
+            ft.append("[Q] ", style="bold red"); ft.append("Quit", style="white")
+            layout["footer"].update(Panel(ft, style="white on #030508", border_style="#00ffff"))
+            return layout
 
         # Main Split
         layout["main"].split_row(
@@ -1030,7 +1187,7 @@ class SDRScout:
         ft = Text(" GAIN: ", style="bold #ff8c00")
         ft.append("[+/-] ", style="bold #ff8c00"); ft.append(f"{self.active_gain_db:.1f}dB  ", style="bold #ffa500")
         
-        # Audio / Silent Mute
+        # Audio / Silent Mute / Logs
         ft.append("| COMMS: ", style="bold cyan")
         if self.ai_comms_active:
             ft.append("[5] ", style="bold #00ffff"); ft.append("AI STOP  ", style="bold #00ffff blink")
@@ -1039,15 +1196,17 @@ class SDRScout:
         else:
             ft.append("[5] ", style="bold #00ffff"); ft.append("AI Scout  ", style="white")
 
+        ft.append("[L] ", style="bold #00ffff"); ft.append("Logbook  ", style="white")
+
         ft.append("| AUDIO: ", style="bold green")
         if self.live_audio_active:
             ft.append("[T] ", style="bold red"); ft.append("MUTE AUDIO  ", style="bold red blink")
         else:
             ft.append("[T] ", style="bold green"); ft.append("Tune Live  ", style="white")
 
-        ft.append("[W] ", style="bold yellow"); ft.append("NOAA Voice  ", style="white")
+        ft.append("[W] ", style="bold yellow"); ft.append("NOAA  ", style="white")
         
-        sq_label = "Squelched" if self.squelch_active else "Open Static"
+        sq_label = "Squelch" if self.squelch_active else "Static"
         ft.append("[O] ", style="bold cyan"); ft.append(f"{sq_label}  ", style="white")
         ft.append("[S] ", style="bold cyan"); ft.append("Scan  ", style="white")
         
@@ -1074,11 +1233,18 @@ class SDRScout:
                     if raw in (b'\x00', b'\xe0'):
                         arrow = msvcrt.getch()
                         if arrow == b'H':  # Up Arrow
-                            self.select_station(self.selected_station_idx - 1)
+                            if self.view_mode == "LOGS":
+                                self.scroll_logs(-1)
+                            else:
+                                self.select_station(self.selected_station_idx - 1)
                         elif arrow == b'P':  # Down Arrow
-                            self.select_station(self.selected_station_idx + 1)
+                            if self.view_mode == "LOGS":
+                                self.scroll_logs(1)
+                            else:
+                                self.select_station(self.selected_station_idx + 1)
                     else:
                         ch = raw.decode("utf-8", errors="ignore").lower()
+                        # Global Quit
                         if ch == "q":
                             self.stop_live_tune()
                             self.stop_ai_comms()
@@ -1088,6 +1254,21 @@ class SDRScout:
                                 self.logger_proc.kill()
                             self.running = False
                             break
+
+                        # Log Viewer Controls
+                        elif ch == "l" or raw == b'\x1b':  # [L] or [Esc]
+                            self.toggle_view_mode()
+                        elif self.view_mode == "LOGS":
+                            if ch in ("n", "j"):
+                                self.scroll_logs(1)
+                            elif ch in ("p", "k"):
+                                self.scroll_logs(-1)
+                            elif ch == "f":
+                                self.cycle_log_filter()
+                            elif ch in ("c", " "):
+                                self.copy_selected_log_row()
+
+                        # Main HUD Controls (Only active when in HUD mode)
                         elif ch in ("+", "=", "]"):
                             self.adjust_gain(1)
                         elif ch in ("-", "_", "["):
