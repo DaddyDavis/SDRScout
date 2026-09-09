@@ -1,0 +1,137 @@
+[
+  {
+    "id": "1",
+    "name": "LUCEDALE (George Co Repeater)",
+    "freq": "147.285",
+    "offset": "+0.600",
+    "tone": "107.2",
+    "mode": "FM",
+    "notes": "Primary George County local repeater"
+  },
+  {
+    "id": "2",
+    "name": "WIGGINS (Stone Co Repeater)",
+    "freq": "145.230",
+    "offset": "-0.600",
+    "tone": "107.2",
+    "mode": "FM",
+    "notes": "Stone County primary repeater"
+  },
+  {
+    "id": "3",
+    "name": "MARC Mobile ARC",
+    "freq": "146.820",
+    "offset": "-0.600",
+    "tone": "203.5",
+    "mode": "FM",
+    "notes": "Mobile Amateur Radio Club primary"
+  },
+  {
+    "id": "4",
+    "name": "PASCAGOULA (Jackson Co)",
+    "freq": "145.110",
+    "offset": "-0.600",
+    "tone": "123.0",
+    "mode": "FM",
+    "notes": "Jackson County coastal repeater"
+  },
+  {
+    "id": "5",
+    "name": "MOBILE UHF (70cm)",
+    "freq": "444.600",
+    "offset": "+5.000",
+    "tone": "203.5",
+    "mode": "FM",
+    "notes": "Mobile AL 70cm high power repeater"
+  },
+  {
+    "id": "6",
+    "name": "HATTIESBURG (Forrest Co)",
+    "freq": "146.940",
+    "offset": "-0.600",
+    "tone": "136.5",
+    "mode": "FM",
+    "notes": "Forrest County Hattiesburg repeater"
+  },
+  {
+    "id": "7",
+    "name": "BILOXI (Harrison Co)",
+    "freq": "146.790",
+    "offset": "-0.600",
+    "tone": "136.5",
+    "mode": "FM",
+    "notes": "Harrison County Biloxi coastal repeater"
+  },
+  {
+    "id": "8",
+    "name": "OCEAN SPRINGS",
+    "freq": "147.165",
+    "offset": "+0.600",
+    "tone": "123.0",
+    "mode": "FM",
+    "notes": "Ocean Springs MS coastal link"
+  },
+  {
+    "id": "9",
+    "name": "2M NATIONAL CALLING",
+    "freq": "146.520",
+    "offset": "Simplex",
+    "tone": "None",
+    "mode": "FM",
+    "notes": "VHF National Calling frequency"
+  },
+  {
+    "id": "10",
+    "name": "70CM NATIONAL CALLING",
+    "freq": "446.000",
+    "offset": "Simplex",
+    "tone": "None",
+    "mode": "FM",
+    "notes": "UHF National Calling frequency"
+  },
+  {
+    "id": "11",
+    "name": "NOAA WEATHER (Mobile)",
+    "freq": "162.550",
+    "offset": "Simplex",
+    "tone": "None",
+    "mode": "NFM",
+    "notes": "KEC61 Mobile AL marine weather broadcast"
+  },
+  {
+    "id": "12",
+    "name": "NOAA WEATHER (Gulfport/Biloxi)",
+    "freq": "162.400",
+    "offset": "Simplex",
+    "tone": "None",
+    "mode": "NFM",
+    "notes": "KIH21 Gulfport MS regional weather"
+  },
+  {
+    "id": "13",
+    "name": "NOAA WEATHER (Bogalusa/Hattiesburg)",
+    "freq": "162.475",
+    "offset": "Simplex",
+    "tone": "None",
+    "mode": "NFM",
+    "notes": "WNG521 Inland storm & severe weather"
+  },
+  {
+    "id": "14",
+    "name": "MURS 1",
+    "freq": "151.820",
+    "offset": "Simplex",
+    "tone": "None",
+    "mode": "NFM",
+    "notes": "License-free VHF tactical"
+  },
+  {
+    "id": "15",
+    "name": "MURS 2",
+    "freq": "151.880",
+    "offset": "Simplex",
+    "tone": "None",
+    "mode": "NFM",
+    "notes": "License-free VHF tactical"
+  }
+]
