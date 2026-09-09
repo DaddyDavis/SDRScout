@@ -100,7 +100,9 @@ class SDRScout:
         self.active_test_name = "System Ready"
         self.last_test_time = "Never"
         self.hardware_status = "READY"
-        self.active_gain_db = 12.5
+        self.gain_steps = [0.0, 0.9, 1.4, 2.7, 3.7, 7.7, 8.7, 12.5, 14.4, 15.7, 16.6, 19.7, 20.7, 22.9, 25.4, 28.0, 29.7, 32.8, 33.8, 36.4, 37.2, 38.6, 40.2, 42.1, 43.4, 43.9, 44.5, 48.0, 49.6]
+        self.gain_idx = 7  # default 12.5 dB
+        self.active_gain_db = self.gain_steps[self.gain_idx]
         self.is_overload_risk = False
         self.rf_power_dbfs = -17.2
         self.selected_station_idx = 0
@@ -123,8 +125,8 @@ class SDRScout:
 
         self.diagnostic_analysis = [
             "[bold green]SYSTEM READY:[/bold green] Nooelec NESDR SMArt v5 connected.",
-            "[bold cyan]TELEMETRY:[/bold cyan] 12.5 dB hardware gain locked. R820T TCXO calibrated.",
-            "[bold white]CONTROLS:[/bold white] [T] Live Audio | [W] NOAA 24/7 Voice | [O] Squelch | [S] Scan Hot."
+            f"[bold #ff8c00]HARDWARE GAIN:[/bold #ff8c00] {self.active_gain_db:.1f} dB dialed. Press [+/-] to adjust.",
+            "[bold white]CONTROLS:[/bold white] [+/-] Orange Gain | [T] Live Audio | [W] NOAA 24/7 Voice | [O] Squelch | [S] Scan."
         ]
         self.raw_output_lines = []
         self.tcp_process = None
@@ -222,6 +224,38 @@ class SDRScout:
             tag = "WEAK RF PASS"
 
         return f"[{color}][{'|' * bars}{' ' * empty}] {db:.1f} dBFS ({tag})[/{color}]"
+
+    def render_gain_gauge(self):
+        max_gain = self.gain_steps[-1]  # 49.6 dB
+        curr_gain = self.active_gain_db
+        ratio = max(0.0, min(1.0, curr_gain / max_gain))
+        bars = int(ratio * 16)
+        empty = 16 - bars
+
+        warn = " (NOMINAL)"
+        if curr_gain > 36.0:
+            warn = " (MAX LNA)"
+        elif curr_gain > 20.0:
+            warn = " (HIGH GAIN)"
+
+        return f"[bold #ff8c00][{'|' * bars}{' ' * empty}] {curr_gain:.1f} dB{warn}[/bold #ff8c00]"
+
+    def adjust_gain(self, delta):
+        old_val = self.active_gain_db
+        self.gain_idx = max(0, min(len(self.gain_steps) - 1, self.gain_idx + delta))
+        self.active_gain_db = self.gain_steps[self.gain_idx]
+        play_chime("click")
+
+        self.diagnostic_analysis = [
+            f"[bold #ff8c00]TUNER HARDWARE GAIN:[/bold #ff8c00] Adjusted {old_val:.1f} dB -> [bold #ffa500]{self.active_gain_db:.1f} dB[/bold #ffa500].",
+            f"[bold #ff8c00]GAUGE:[/bold #ff8c00] {self.render_gain_gauge()}",
+            "[bold white]TACTICAL ADVICE:[/bold white] High gain (36-44 dB) helps pull weak signals through lossy coax."
+        ]
+
+        # If live audio is currently playing, dynamically re-tune with new gain
+        if self.live_audio_active:
+            self.stop_live_tune()
+            self.toggle_live_tune()
 
     # Test 1: Hardware & Gain Audit + Power Check
     def run_hardware_audit(self):
@@ -462,10 +496,11 @@ class SDRScout:
                 self.hardware_status = f"LIVE AUDIO: {freq} MHz"
                 
                 squelch_args = ["-l", "45"] if self.squelch_active else ["-l", "0"]
+                gain_args = ["-g", str(self.active_gain_db)]
                 
-                # Start rtl_fm piping into ffplay with de-emphasis filter (-E deemp)
+                # Start rtl_fm piping into ffplay with de-emphasis filter (-E deemp) and active hardware gain
                 self.live_tune_rtl_proc = subprocess.Popen(
-                    [rtl_exe, "-f", freq_hz, "-M", "fm", "-s", "24000", "-r", "24000", "-E", "deemp"] + squelch_args + ["-"],
+                    [rtl_exe, "-f", freq_hz, "-M", "fm", "-s", "24000", "-r", "24000", "-E", "deemp"] + gain_args + squelch_args + ["-"],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE
                 )
                 
@@ -491,8 +526,8 @@ class SDRScout:
                 sq_mode = "SQUELCHED (Static-free until voice transmission)" if self.squelch_active else "OPEN SQUELCH (Raw static/carrier audible)"
                 self.diagnostic_analysis = [
                     f"[bold green]LIVE AUDIO STREAMING:[/bold green] {name} ({freq} MHz).",
-                    f"[bold cyan]SQUELCH GATE:[/bold cyan] {sq_mode}.",
-                    "[bold yellow]CONTROLS:[/bold yellow] Press [O] to toggle squelch | [T] to mute | [W] for NOAA voice."
+                    f"[bold #ff8c00]TUNER GAIN:[/bold #ff8c00] {self.active_gain_db:.1f} dB (Press [+/-] to boost/cut).",
+                    f"[bold cyan]SQUELCH GATE:[/bold cyan] {sq_mode} [Press O to toggle]."
                 ]
             except Exception as e:
                 self.stop_live_tune()
@@ -665,11 +700,13 @@ class SDRScout:
         hdr.append("| TACTICAL SIGNAL DIAGNOSTIC & RADIO TOOLKIT  ", style="bold white")
         hdr.append(f"[DEVICE: {self.hardware_status}]  ", style="bold yellow")
         
-        # Overload badge
-        if self.active_gain_db > 20.0:
-            hdr.append("[ALERT: OVERLOAD RISK >20dB]  ", style="bold red blink")
+        # Gain badge in orange
+        if self.active_gain_db > 36.0:
+            hdr.append(f"[GAIN: {self.active_gain_db:.1f} dB (MAX)]  ", style="bold #ff8c00 blink")
+        elif self.active_gain_db > 20.0:
+            hdr.append(f"[GAIN: {self.active_gain_db:.1f} dB (HIGH)]  ", style="bold #ff8c00")
         else:
-            hdr.append(f"[GAIN: {self.active_gain_db:.1f} dB]  ", style="bold green")
+            hdr.append(f"[GAIN: {self.active_gain_db:.1f} dB]  ", style="bold #ffa500")
 
         # Live Audio Streaming badge
         if self.live_audio_active:
@@ -702,13 +739,15 @@ class SDRScout:
 
         raw_layout = Layout()
         raw_layout.split_column(
-            Layout(name="rf_meter", size=3),
+            Layout(name="meters_box", size=4),
             Layout(name="stream_box")
         )
 
-        # Live ASCII Noise Floor / SNR Meter
-        meter_text = Text.from_markup(f"RF Power: {self.render_rf_meter()}")
-        raw_layout["rf_meter"].update(Panel(meter_text, title="Live 2M Band RF Energy Meter", border_style="cyan"))
+        # Live ASCII Gauges: RF Noise Floor & Tuner Hardware Gain in Orange
+        meters_text = Text()
+        meters_text.append_text(Text.from_markup(f"RF Level:   {self.render_rf_meter()}\n"))
+        meters_text.append_text(Text.from_markup(f"Tuner Gain: {self.render_gain_gauge()}"))
+        raw_layout["meters_box"].update(Panel(meters_text, title="Live RF Energy & Tuner Gain Gauges", border_style="#ff8c00"))
 
         raw_text = Text()
         for r_line in self.raw_output_lines[-6:]:
@@ -750,7 +789,9 @@ class SDRScout:
         layout["main"]["right_panel"].update(Panel(freq_table, title=right_panel_title, border_style="yellow"))
 
         # Footer Menu
-        ft = Text(" AUDIO: ", style="bold green")
+        ft = Text(" GAIN: ", style="bold #ff8c00")
+        ft.append("[+/-] ", style="bold #ff8c00"); ft.append(f"{self.active_gain_db:.1f}dB  ", style="bold #ffa500")
+        ft.append("| AUDIO: ", style="bold green")
         if self.live_audio_active:
             ft.append("[T] ", style="bold red"); ft.append("MUTE AUDIO  ", style="bold red blink")
         else:
@@ -804,6 +845,10 @@ class SDRScout:
                                 self.logger_proc.kill()
                             self.running = False
                             break
+                        elif ch in ("+", "=", "]"):
+                            self.adjust_gain(1)
+                        elif ch in ("-", "_", "["):
+                            self.adjust_gain(-1)
                         elif ch in ("n", "j"):  # Next station
                             self.select_station(self.selected_station_idx + 1)
                         elif ch in ("p", "k"):  # Previous station

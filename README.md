@@ -8,9 +8,12 @@ SDRScout is a 1-click tactical terminal HUD and signal diagnostic engine built f
 
 | Key | Action | Description |
 | :--- | :--- | :--- |
+| `[+]` / `[-]` | Dial Tuner Gain (Orange Gauge) | Steps through 29 discrete hardware gain steps (0.0 to 49.6 dB) in real-time. Also supports `[=]` / `[_]` and `[` / `]`. |
 | `[Up]` / `[Down]` | Scroll Station List | Moves cursor up/down through repeater channels, highlights active row, and copies frequency to clipboard. |
 | `[N]` / `[P]` | Next / Previous Station | Ergonomic single-hand alternative to arrow keys for switching channels. |
 | `[T]` | Live Audio Stream (Toggle) | Pipes `rtl_fm` demod directly into `ffplay` to listen to the selected channel in real-time. Press again to mute. |
+| `[W]` | NOAA Weather Voice (24/7) | Instantly tunes 162.550 MHz (Mobile/Gulf Coast NOAA) for continuous voice audio benchmarking. |
+| `[O]` | Squelch Gate Toggle | Toggles between Open Static (raw FM noise) and Squelched (silent until someone keys up). |
 | `[S]` | ARES Hot Carrier Scan | Sweeps 10 local repeaters for active voice traffic. Snaps cursor to whichever channel breaks squelch. |
 | `[Space]` | Copy Frequency | Copies the active channel's frequency directly to Windows clipboard with click chime. |
 | `[1]` | Hardware & Gain Audit | Verifies USB throughput at 2.4 MSPS, checks 29 tuner gain steps, tests for dropped samples. |
