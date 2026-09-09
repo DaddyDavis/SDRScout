@@ -8,6 +8,7 @@ import msvcrt
 import winsound
 import ctypes
 import re
+import shutil
 from datetime import datetime
 
 import win32gui
@@ -95,6 +96,7 @@ class SDRScout:
         self.lock_mutex = self.acquire_single_instance_lock()
         self.frequencies = self.load_frequencies()
         self.running = True
+        self.is_busy = False
         self.active_test_name = "System Ready"
         self.last_test_time = "Never"
         self.hardware_status = "READY"
@@ -104,10 +106,15 @@ class SDRScout:
         self.selected_station_idx = 0
         self.selected_freq_obj = self.frequencies[0] if self.frequencies else None
         
-        # Audio Logger State
+        # Audio Logger State (Key [5])
         self.audio_logger_active = False
         self.logger_proc = None
         self.logger_file = ""
+
+        # Live Audio Streaming State (Key [T])
+        self.live_audio_active = False
+        self.live_tune_rtl_proc = None
+        self.live_tune_ffplay_proc = None
 
         # Visual Heartbeat State
         self.spinner_chars = ["|", "/", "-", "\\"]
@@ -116,10 +123,13 @@ class SDRScout:
         self.diagnostic_analysis = [
             "[bold green]SYSTEM READY:[/bold green] Nooelec NESDR SMArt v5 connected.",
             "[bold cyan]TELEMETRY:[/bold cyan] 12.5 dB hardware gain locked. R820T TCXO calibrated.",
-            "[bold white]CONTROLS:[/bold white] [Up/Down or N/P] Select Station | [T] Tune | [1]-[8] Matrix Diagnostics."
+            "[bold white]CONTROLS:[/bold white] [Up/Dn/N/P] Station | [T] Live Audio | [S] Scan Hot | [1]-[8] Matrix."
         ]
         self.raw_output_lines = []
         self.tcp_process = None
+
+        # Start continuous background idle RF poller
+        self.start_rf_poller_thread()
 
     def select_station(self, new_idx):
         if not self.frequencies:
@@ -167,6 +177,28 @@ class SDRScout:
             return p
         return name
 
+    def get_ffplay_exe(self):
+        p = shutil.which("ffplay")
+        if p and os.path.exists(p):
+            return p
+        default_p = r"C:\Users\daddy\AppData\Local\Microsoft\WinGet\Packages\yt-dlp.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-N-125875-g5d4d3bdc61-win64-gpl\bin\ffplay.exe"
+        if os.path.exists(default_p):
+            return default_p
+        return "ffplay.exe"
+
+    def start_rf_poller_thread(self):
+        threading.Thread(target=self._rf_poller_loop, daemon=True).start()
+
+    def _rf_poller_loop(self):
+        while self.running:
+            time.sleep(3.5)
+            # Only poll when completely idle
+            if not self.is_busy and not self.live_audio_active and not self.audio_logger_active and not self.tcp_process:
+                try:
+                    self.measure_band_power()
+                except Exception:
+                    pass
+
     def render_rf_meter(self):
         db = self.rf_power_dbfs
         # Scale -60 dBFS (noise/disconnected) to -5 dBFS (clipping)
@@ -192,49 +224,57 @@ class SDRScout:
 
     # Test 1: Hardware & Gain Audit + Power Check
     def run_hardware_audit(self):
-        self.active_test_name = "Hardware & Gain Audit"
-        self.hardware_status = "SCANNING"
-        self.raw_output_lines = ["Executing: rtl_test -s 2400000 (Benchmarking USB & Tuner)..."]
-        
-        exe = self.get_rtl_exe("rtl_test.exe")
-        full_text = run_rtl_cmd_timeout([exe, "-s", "2400000"], 3.0)
-
-        self.last_test_time = time.strftime("%I:%M:%S %p")
-        self.raw_output_lines = [l.strip()[:65] for l in full_text.splitlines() if l.strip()][-8:]
-
-        analysis = []
-        if "Nooelec" in full_text or "Generic RTL" in full_text:
-            self.hardware_status = "ONLINE (OPTIMAL)"
-            play_chime("success")
-            analysis.append("[bold green]HARDWARE DISCOVERED:[/bold green] Nooelec NESDR SMArt v5 (Rafael Micro R820T tuner).")
+        if self.live_audio_active:
+            self.stop_live_tune()
+        self.is_busy = True
+        try:
+            self.active_test_name = "Hardware & Gain Audit"
+            self.hardware_status = "SCANNING"
+            self.raw_output_lines = ["Executing: rtl_test -s 2400000 (Benchmarking USB & Tuner)..."]
             
-            m_gains = re.search(r'Supported gain values \((\d+)\): ([\d\.\s]+)', full_text)
-            if m_gains:
-                g_count = m_gains.group(1)
-                analysis.append(f"[bold cyan]TUNER CAPABILITY:[/bold cyan] {g_count} discrete RF gain steps from 0.0 dB to 49.6 dB verified.")
-            
-            if "lost" not in full_text.lower():
-                analysis.append("[bold green]USB BUS HEALTH:[/bold green] 2.4 MSPS clean stream with 0 dropped samples or buffer under-runs.")
-                analysis.append("[bold white]TACTICAL ADVICE:[/bold white] Baseline gain 12.5 dB is optimal for local VHF repeaters. Use 28-36 dB for weak NOAA/ISS passes.")
+            exe = self.get_rtl_exe("rtl_test.exe")
+            full_text = run_rtl_cmd_timeout([exe, "-s", "2400000"], 3.0)
+
+            self.last_test_time = time.strftime("%I:%M:%S %p")
+            self.raw_output_lines = [l.strip()[:65] for l in full_text.splitlines() if l.strip()][-8:]
+
+            analysis = []
+            if "Nooelec" in full_text or "Generic RTL" in full_text:
+                self.hardware_status = "ONLINE (OPTIMAL)"
+                play_chime("success")
+                analysis.append("[bold green]HARDWARE DISCOVERED:[/bold green] Nooelec NESDR SMArt v5 (Rafael Micro R820T tuner).")
+                
+                m_gains = re.search(r'Supported gain values \((\d+)\): ([\d\.\s]+)', full_text)
+                if m_gains:
+                    g_count = m_gains.group(1)
+                    analysis.append(f"[bold cyan]TUNER CAPABILITY:[/bold cyan] {g_count} discrete RF gain steps from 0.0 dB to 49.6 dB verified.")
+                
+                if "lost" not in full_text.lower():
+                    analysis.append("[bold green]USB BUS HEALTH:[/bold green] 2.4 MSPS clean stream with 0 dropped samples or buffer under-runs.")
+                    analysis.append("[bold white]TACTICAL ADVICE:[/bold white] Baseline gain 12.5 dB is optimal for local VHF repeaters. Use 28-36 dB for weak NOAA/ISS passes.")
+                else:
+                    analysis.append("[bold yellow]THROUGHPUT NOTICE:[/bold yellow] Minor dropped samples detected. Ensure dongle is on a direct USB port.")
+                
+                # Quick noise floor sweep
+                self.measure_band_power()
+            elif "No supported devices found" in full_text:
+                self.hardware_status = "DISCONNECTED"
+                self.rf_power_dbfs = -55.0
+                play_chime("alert")
+                analysis.append("[bold red]ERROR - NO DEVICE:[/bold red] USB RTL-SDR dongle not detected by driver.")
+                analysis.append("[bold yellow]TROUBLESHOOTING:[/bold yellow] Check USB connection or verify Oracle VirtualBox has not captured the USB filter.")
             else:
-                analysis.append("[bold yellow]THROUGHPUT NOTICE:[/bold yellow] Minor dropped samples detected. Ensure dongle is on a direct USB port.")
-            
-            # Quick noise floor sweep
-            self.measure_band_power()
-        elif "No supported devices found" in full_text:
-            self.hardware_status = "DISCONNECTED"
-            self.rf_power_dbfs = -55.0
-            play_chime("alert")
-            analysis.append("[bold red]ERROR - NO DEVICE:[/bold red] USB RTL-SDR dongle not detected by driver.")
-            analysis.append("[bold yellow]TROUBLESHOOTING:[/bold yellow] Check USB connection or verify Oracle VirtualBox has not captured the USB filter.")
-        else:
-            self.hardware_status = "RESOURCE LOCKED"
-            play_chime("alert")
-            analysis.append("[bold yellow]RESOURCE LOCKED:[/bold yellow] Another application (SDR Console, SDR++, or VirtualBox) is currently using the tuner.")
+                self.hardware_status = "RESOURCE LOCKED"
+                play_chime("alert")
+                analysis.append("[bold yellow]RESOURCE LOCKED:[/bold yellow] Another application (SDR Console, SDR++, or VirtualBox) is currently using the tuner.")
 
-        self.diagnostic_analysis = analysis
+            self.diagnostic_analysis = analysis
+        finally:
+            self.is_busy = False
 
     def measure_band_power(self):
+        if self.is_busy or self.live_audio_active or self.audio_logger_active or self.tcp_process:
+            return
         exe = self.get_rtl_exe("rtl_power.exe")
         out = run_rtl_cmd_timeout([exe, "-f", "144M:148M:1M", "-i", "1", "-e", "1", "-"], 1.5)
         # Parse last dBFS value
@@ -248,84 +288,102 @@ class SDRScout:
 
     # Test 2: PPM Thermal Drift
     def run_ppm_calibration(self):
-        self.active_test_name = "PPM Thermal Drift Test"
-        self.hardware_status = "CALIBRATING"
-        self.raw_output_lines = ["Executing: rtl_test -p (Sampling crystal frequency offset)..."]
-        
-        exe = self.get_rtl_exe("rtl_test.exe")
-        full_text = run_rtl_cmd_timeout([exe, "-p"], 4.0)
+        if self.live_audio_active:
+            self.stop_live_tune()
+        self.is_busy = True
+        try:
+            self.active_test_name = "PPM Thermal Drift Test"
+            self.hardware_status = "CALIBRATING"
+            self.raw_output_lines = ["Executing: rtl_test -p (Sampling crystal frequency offset)..."]
+            
+            exe = self.get_rtl_exe("rtl_test.exe")
+            full_text = run_rtl_cmd_timeout([exe, "-p"], 4.0)
 
-        self.last_test_time = time.strftime("%I:%M:%S %p")
-        self.raw_output_lines = [l.strip()[:65] for l in full_text.splitlines() if l.strip()][-8:]
+            self.last_test_time = time.strftime("%I:%M:%S %p")
+            self.raw_output_lines = [l.strip()[:65] for l in full_text.splitlines() if l.strip()][-8:]
 
-        analysis = []
-        if "Found" in full_text:
-            self.hardware_status = "CALIBRATED"
-            play_chime("success")
-            analysis.append("[bold green]TCXO OSCILLATOR BENCHMARK:[/bold green] NESDR SMArt v5 temperature-compensated crystal active.")
-            analysis.append("[bold cyan]FACTORY SPEC:[/bold cyan] 0.5 PPM guaranteed TCXO drift stability across -20C to +70C.")
-            analysis.append("[bold white]TACTICAL ADVICE:[/bold white] With < 1 PPM offset, leave PPM set to '0' in SDR Console and SDR++. Frequency lock is razor-sharp.")
-        else:
-            self.hardware_status = "OFFLINE"
-            play_chime("alert")
-            analysis.append("[bold red]CALIBRATION ABORTED:[/bold red] Dongle not accessible or locked by another app.")
+            analysis = []
+            if "Found" in full_text:
+                self.hardware_status = "CALIBRATED"
+                play_chime("success")
+                analysis.append("[bold green]TCXO OSCILLATOR BENCHMARK:[/bold green] NESDR SMArt v5 temperature-compensated crystal active.")
+                analysis.append("[bold cyan]FACTORY SPEC:[/bold cyan] 0.5 PPM guaranteed TCXO drift stability across -20C to +70C.")
+                analysis.append("[bold white]TACTICAL ADVICE:[/bold white] With < 1 PPM offset, leave PPM set to '0' in SDR Console and SDR++. Frequency lock is razor-sharp.")
+            else:
+                self.hardware_status = "OFFLINE"
+                play_chime("alert")
+                analysis.append("[bold red]CALIBRATION ABORTED:[/bold red] Dongle not accessible or locked by another app.")
 
-        self.diagnostic_analysis = analysis
+            self.diagnostic_analysis = analysis
+        finally:
+            self.is_busy = False
 
     # Test 3: NOAA Weather Live RF Check
     def run_noaa_check(self):
-        self.active_test_name = "NOAA Weather Radio Check (162.550 MHz)"
-        self.hardware_status = "MONITORING"
-        self.raw_output_lines = ["Tuning to 162.550 MHz (Mobile/Gulf Coast NOAA KEC61)..."]
+        if self.live_audio_active:
+            self.stop_live_tune()
+        self.is_busy = True
+        try:
+            self.active_test_name = "NOAA Weather Radio Check (162.550 MHz)"
+            self.hardware_status = "MONITORING"
+            self.raw_output_lines = ["Tuning to 162.550 MHz (Mobile/Gulf Coast NOAA KEC61)..."]
 
-        exe = self.get_rtl_exe("rtl_fm.exe")
-        full_text = run_rtl_cmd_timeout([exe, "-f", "162550000", "-M", "fm", "-s", "24000", "-r", "24000", "-"], 3.5)
+            exe = self.get_rtl_exe("rtl_fm.exe")
+            full_text = run_rtl_cmd_timeout([exe, "-f", "162550000", "-M", "fm", "-s", "24000", "-r", "24000", "-"], 3.5)
 
-        self.last_test_time = time.strftime("%I:%M:%S %p")
-        self.raw_output_lines = [l.strip()[:65] for l in full_text.splitlines() if l.strip()][-8:]
+            self.last_test_time = time.strftime("%I:%M:%S %p")
+            self.raw_output_lines = [l.strip()[:65] for l in full_text.splitlines() if l.strip()][-8:]
 
-        analysis = []
-        if "Tuned" in full_text or "Exact" in full_text or "Found" in full_text:
-            self.hardware_status = "RF PATH VERIFIED"
-            self.rf_power_dbfs = -14.2
-            play_chime("success")
-            analysis.append("[bold green]RF FRONT-END ACTIVE:[/bold green] Tuned to 162.550 MHz (Gulf Coast NOAA Weather).")
-            analysis.append("[bold cyan]IMPEDANCE & GAIN:[/bold cyan] 50-ohm RF input stage responsive. Antenna connected and matched.")
-            analysis.append("[bold white]TACTICAL ADVICE:[/bold white] Local VHF emergency broadcasts are reachable on your current antenna setup.")
-        else:
-            self.hardware_status = "BUSY / OFFLINE"
-            play_chime("alert")
-            analysis.append("[bold yellow]RF CHECK NOTICE:[/bold yellow] Device was busy or occupied by another active process.")
+            analysis = []
+            if "Tuned" in full_text or "Exact" in full_text or "Found" in full_text:
+                self.hardware_status = "RF PATH VERIFIED"
+                self.rf_power_dbfs = -14.2
+                play_chime("success")
+                analysis.append("[bold green]RF FRONT-END ACTIVE:[/bold green] Tuned to 162.550 MHz (Gulf Coast NOAA Weather).")
+                analysis.append("[bold cyan]IMPEDANCE & GAIN:[/bold cyan] 50-ohm RF input stage responsive. Antenna connected and matched.")
+                analysis.append("[bold white]TACTICAL ADVICE:[/bold white] Local VHF emergency broadcasts are reachable on your current antenna setup.")
+            else:
+                self.hardware_status = "BUSY / OFFLINE"
+                play_chime("alert")
+                analysis.append("[bold yellow]RF CHECK NOTICE:[/bold yellow] Device was busy or occupied by another active process.")
 
-        self.diagnostic_analysis = analysis
+            self.diagnostic_analysis = analysis
+        finally:
+            self.is_busy = False
 
     # Test 4: ADS-B Flight Transponder Scout
     def run_adsb_scout(self):
-        self.active_test_name = "ADS-B Aircraft Scout (1090 MHz)"
-        self.hardware_status = "INTERCEPTING"
-        self.raw_output_lines = ["Listening on 1090 MHz for Gulf Coast airspace transponders..."]
+        if self.live_audio_active:
+            self.stop_live_tune()
+        self.is_busy = True
+        try:
+            self.active_test_name = "ADS-B Aircraft Scout (1090 MHz)"
+            self.hardware_status = "INTERCEPTING"
+            self.raw_output_lines = ["Listening on 1090 MHz for Gulf Coast airspace transponders..."]
 
-        exe = self.get_rtl_exe("rtl_adsb.exe")
-        full_text = run_rtl_cmd_timeout([exe], 4.5)
+            exe = self.get_rtl_exe("rtl_adsb.exe")
+            full_text = run_rtl_cmd_timeout([exe], 4.5)
 
-        self.last_test_time = time.strftime("%I:%M:%S %p")
-        frames = [l.strip() for l in full_text.splitlines() if l.strip().startswith("*")]
-        self.raw_output_lines = [l.strip()[:65] for l in full_text.splitlines() if l.strip()][-8:]
+            self.last_test_time = time.strftime("%I:%M:%S %p")
+            frames = [l.strip() for l in full_text.splitlines() if l.strip().startswith("*")]
+            self.raw_output_lines = [l.strip()[:65] for l in full_text.splitlines() if l.strip()][-8:]
 
-        analysis = []
-        if frames:
-            self.hardware_status = f"INTERCEPTED {len(frames)} PINGS"
-            play_chime("success")
-            analysis.append(f"[bold green]AIRSPACE INTERCEPT ACTIVE:[/bold green] Decoded {len(frames)} raw Mode-S aircraft frames.")
-            analysis.append(f"[bold cyan]LATEST PACKET:[/bold cyan] {frames[-1]}")
-            analysis.append("[bold white]TACTICAL ADVICE:[/bold white] 1090 MHz UHF performance confirmed. Antenna is pulling commercial air traffic over the Gulf Coast.")
-        else:
-            self.hardware_status = "ZERO FRAMES"
-            play_chime("alert")
-            analysis.append("[bold yellow]ZERO AIRCRAFT INTERCEPTS:[/bold yellow] No 1090 MHz frames received in window.")
-            analysis.append("[bold white]TACTICAL ADVICE:[/bold white] If indoor antenna is shielded, reposition near a window or check line of sight.")
+            analysis = []
+            if frames:
+                self.hardware_status = f"INTERCEPTED {len(frames)} PINGS"
+                play_chime("success")
+                analysis.append(f"[bold green]AIRSPACE INTERCEPT ACTIVE:[/bold green] Decoded {len(frames)} raw Mode-S aircraft frames.")
+                analysis.append(f"[bold cyan]LATEST PACKET:[/bold cyan] {frames[-1]}")
+                analysis.append("[bold white]TACTICAL ADVICE:[/bold white] 1090 MHz UHF performance confirmed. Antenna is pulling commercial air traffic over the Gulf Coast.")
+            else:
+                self.hardware_status = "ZERO FRAMES"
+                play_chime("alert")
+                analysis.append("[bold yellow]ZERO AIRCRAFT INTERCEPTS:[/bold yellow] No 1090 MHz frames received in window.")
+                analysis.append("[bold white]TACTICAL ADVICE:[/bold white] If indoor antenna is shielded, reposition near a window or check line of sight.")
 
-        self.diagnostic_analysis = analysis
+            self.diagnostic_analysis = analysis
+        finally:
+            self.is_busy = False
 
     # Key [5]: Audio Logger Hook
     def toggle_audio_logger(self):
@@ -338,6 +396,7 @@ class SDRScout:
                 except Exception:
                     pass
             self.audio_logger_active = False
+            self.is_busy = False
             play_chime("rec_stop")
             self.diagnostic_analysis = [
                 "[bold yellow]AUDIO LOGGER STOPPED.[/bold yellow]",
@@ -345,6 +404,8 @@ class SDRScout:
                 "[bold cyan]STATUS:[/bold cyan] Channel audio archived to recordings/ folder."
             ]
         else:
+            if self.live_audio_active:
+                self.stop_live_tune()
             # Start logger
             freq = self.selected_freq_obj.get("freq", "147.285") if self.selected_freq_obj else "147.285"
             freq_hz = str(int(float(freq) * 1000000))
@@ -353,6 +414,7 @@ class SDRScout:
             
             exe = self.get_rtl_exe("rtl_fm.exe")
             try:
+                self.is_busy = True
                 self.logger_proc = subprocess.Popen(
                     [exe, "-f", freq_hz, "-M", "fm", "-s", "24000", "-r", "24000", self.logger_file],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
@@ -365,32 +427,140 @@ class SDRScout:
                     "[bold white]TACTICAL CONTROL:[/bold white] Press [5] again to stop logging and commit audio to disk."
                 ]
             except Exception as e:
+                self.is_busy = False
                 self.diagnostic_analysis = [f"[bold red]LOGGER ERROR:[/bold red] {str(e)}"]
 
-    # Key [T]: Tune Live to Selected Repeater
-    def tune_live_selected(self):
-        if not self.selected_freq_obj:
-            return
-        freq = self.selected_freq_obj.get("freq", "147.285")
-        name = self.selected_freq_obj.get("name", "Repeater")
-        freq_hz = str(int(float(freq) * 1000000))
+    # Key [T]: Toggle Live Audio Stream (rtl_fm -> ffplay)
+    def toggle_live_tune(self):
+        if self.live_audio_active:
+            self.stop_live_tune()
+            play_chime("click")
+            self.diagnostic_analysis = [
+                "[bold yellow]LIVE AUDIO MUTED.[/bold yellow]",
+                "[bold cyan]STATUS:[/bold cyan] Demodulator released. Background RF power polling resumed.",
+                "[bold white]CONTROLS:[/bold white] Press [T] to resume listening, or [5] to log audio to disk."
+            ]
+        else:
+            if self.audio_logger_active:
+                self.toggle_audio_logger()
+            if not self.selected_freq_obj:
+                return
+            freq = self.selected_freq_obj.get("freq", "147.285")
+            name = self.selected_freq_obj.get("name", "Repeater")
+            freq_hz = str(int(float(freq) * 1000000))
+            
+            rtl_exe = self.get_rtl_exe("rtl_fm.exe")
+            ffplay_exe = self.get_ffplay_exe()
+            
+            try:
+                self.is_busy = True
+                self.active_test_name = f"Live Monitor ({freq} MHz)"
+                self.hardware_status = f"LIVE AUDIO: {freq} MHz"
+                
+                # Pipe rtl_fm raw PCM S16LE directly into ffplay
+                self.live_tune_rtl_proc = subprocess.Popen(
+                    [rtl_exe, "-f", freq_hz, "-M", "fm", "-s", "24000", "-r", "24000", "-l", "0", "-"],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+                )
+                self.live_tune_ffplay_proc = subprocess.Popen(
+                    [ffplay_exe, "-nodisp", "-autoexit", "-loglevel", "quiet", "-f", "s16le", "-ar", "24000", "-ac", "1", "-i", "-"],
+                    stdin=self.live_tune_rtl_proc.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+                self.live_audio_active = True
+                play_chime("success")
+                self.diagnostic_analysis = [
+                    f"[bold green]LIVE NFM DEMOD STREAMING:[/bold green] {name} ({freq} MHz).",
+                    f"[bold cyan]AUDIO PIPELINE:[/bold cyan] rtl_fm (24k S16LE) -> ffplay -> Windows Audio / FxSound.",
+                    "[bold white]TACTICAL CONTROL:[/bold white] Press [T] again to mute audio stream and free tuner."
+                ]
+            except Exception as e:
+                self.stop_live_tune()
+                self.diagnostic_analysis = [f"[bold red]AUDIO STREAM ERROR:[/bold red] {str(e)}"]
 
-        self.active_test_name = f"Live RF Monitor ({freq} MHz)"
-        self.hardware_status = f"TUNED: {freq} MHz"
-        self.raw_output_lines = [f"Listening live to {name} ({freq} MHz NFM)..."]
+    def stop_live_tune(self):
+        if self.live_tune_ffplay_proc:
+            try:
+                self.live_tune_ffplay_proc.terminate()
+                self.live_tune_ffplay_proc.kill()
+            except Exception:
+                pass
+            self.live_tune_ffplay_proc = None
+        if self.live_tune_rtl_proc:
+            try:
+                self.live_tune_rtl_proc.terminate()
+                self.live_tune_rtl_proc.kill()
+            except Exception:
+                pass
+            self.live_tune_rtl_proc = None
+        self.live_audio_active = False
+        self.hardware_status = "READY"
+        self.is_busy = False
+
+    # Key [S]: ARES Priority Activity Scanner
+    def run_ares_scan(self):
+        if self.is_busy or self.live_audio_active or self.audio_logger_active or self.tcp_process:
+            self.diagnostic_analysis = ["[bold yellow]SCANNER BUSY:[/bold yellow] Stop active audio stream or test before scanning."]
+            return
+
+        self.is_busy = True
+        self.active_test_name = "ARES Priority Activity Scanner"
+        self.hardware_status = "SCANNING ARES"
+        self.raw_output_lines = ["Sweeping 10 ARES frequencies for carrier activity..."]
         play_chime("click")
 
-        exe = self.get_rtl_exe("rtl_fm.exe")
-        full_text = run_rtl_cmd_timeout([exe, "-f", freq_hz, "-M", "fm", "-s", "24000", "-r", "24000", "-"], 4.0)
+        try:
+            exe = self.get_rtl_exe("rtl_power.exe")
+            # Sweep 144M to 148M across 2M repeater segment for 1.5 seconds
+            out = run_rtl_cmd_timeout([exe, "-f", "144M:148M:25k", "-i", "1", "-e", "1", "-"], 2.0)
+            self.last_test_time = time.strftime("%I:%M:%S %p")
+            self.raw_output_lines = [l.strip()[:65] for l in out.splitlines() if l.strip()][-6:]
 
-        self.last_test_time = time.strftime("%I:%M:%S %p")
-        self.raw_output_lines = [l.strip()[:65] for l in full_text.splitlines() if l.strip()][-8:]
+            power_map = {}
+            for line in out.splitlines():
+                parts = [p.strip() for p in line.split(",") if p.strip()]
+                if len(parts) >= 7:
+                    try:
+                        low_f = float(parts[2]) / 1000000.0
+                        step_f = float(parts[4]) / 1000000.0
+                        dbs = [float(x) for x in parts[6:]]
+                        for i, db_val in enumerate(dbs):
+                            curr_f = round(low_f + (i * step_f), 3)
+                            power_map[curr_f] = db_val
+                    except Exception:
+                        pass
 
-        self.diagnostic_analysis = [
-            f"[bold green]TUNED LIVE TO {name}:[/bold green] {freq} MHz.",
-            f"[bold cyan]REPEATER DATA:[/bold cyan] Offset {self.selected_freq_obj.get('offset')} | CTCSS Tone {self.selected_freq_obj.get('tone')} Hz.",
-            "[bold white]STATUS:[/bold white] Live frequency lock completed. Audio demodulated cleanly."
-        ]
+            best_freq_idx = 0
+            best_power = -999.0
+            for idx, item in enumerate(self.frequencies):
+                try:
+                    rf = float(item.get("freq", 0.0))
+                    closest_p = max((p for f, p in power_map.items() if abs(f - rf) <= 0.035), default=-999.0)
+                    if closest_p > best_power:
+                        best_power = closest_p
+                        best_freq_idx = idx
+                except Exception:
+                    pass
+
+            if best_power > -25.0 and self.frequencies:
+                self.select_station(best_freq_idx)
+                hot_station = self.frequencies[best_freq_idx]
+                self.hardware_status = f"HOT: {hot_station.get('freq')} MHz"
+                play_chime("alert")
+                self.diagnostic_analysis = [
+                    f"[bold green]HOT CARRIER DETECTED:[/bold green] {hot_station.get('name')} ({hot_station.get('freq')} MHz).",
+                    f"[bold cyan]SIGNAL STRENGTH:[/bold cyan] {best_power:.1f} dBFS (Carrier Squelch Broken).",
+                    "[bold yellow]TACTICAL ACTION:[/bold yellow] Press [T] to listen live, or [5] to record conversation."
+                ]
+            else:
+                self.hardware_status = "IDLE (QUIET)"
+                play_chime("success")
+                self.diagnostic_analysis = [
+                    "[bold cyan]ARES SCAN COMPLETE:[/bold cyan] All 10 local repeaters quiet (carrier squelch holding).",
+                    f"[bold white]BACKGROUND NOISE FLOOR:[/bold white] Baseline ~{self.rf_power_dbfs:.1f} dBFS.",
+                    "[bold white]STATUS:[/bold white] Repeaters are monitoring. Press [S] anytime to re-scan for traffic."
+                ]
+        finally:
+            self.is_busy = False
 
     # Test 6: Toggle RTL-TCP Server
     def toggle_rtl_tcp(self):
@@ -461,6 +631,11 @@ class SDRScout:
         else:
             hdr.append(f"[GAIN: {self.active_gain_db:.1f} dB]  ", style="bold green")
 
+        # Live Audio Streaming badge
+        if self.live_audio_active:
+            freq_str = self.selected_freq_obj.get("freq", "") if self.selected_freq_obj else ""
+            hdr.append(f"[LIVE AUDIO: {freq_str} MHz]  ", style="bold green blink")
+
         # Heartbeat pulse
         hdr.append(f"[PULSE: {pulse_char} {now_time}]", style="bold cyan")
         layout["header"].update(Panel(hdr, style="green on #030508", border_style="green"))
@@ -505,7 +680,7 @@ class SDRScout:
         left_layout["raw_stream"].update(raw_layout)
         layout["main"]["left_panel"].update(left_layout)
 
-        # Right Panel: Repeater Matrix & Audio Logger Badge
+        # Right Panel: Repeater Matrix & Badges
         freq_table = Table(expand=True, box=None, show_header=True)
         freq_table.add_column("#", style="bold cyan", width=3)
         freq_table.add_column("Channel / Station", style="bold white", width=18)
@@ -527,15 +702,24 @@ class SDRScout:
             )
 
         right_panel_title = "Lucedale & George Co ARES Matrix"
-        if self.audio_logger_active:
+        if self.live_audio_active:
+            right_panel_title += " [bold green][AUDIO MONITOR ON][/bold green]"
+        elif self.audio_logger_active:
             right_panel_title += " [bold red][REC: AUDIO LOGGER ACTIVE][/bold red]"
 
         layout["main"]["right_panel"].update(Panel(freq_table, title=right_panel_title, border_style="yellow"))
 
         # Footer Menu
         ft = Text(" NAV: ", style="bold green")
-        ft.append("[Up/Dn or N/P] ", style="bold green"); ft.append("Station  ", style="white")
-        ft.append("[T] ", style="bold green"); ft.append("Tune  ", style="white")
+        ft.append("[Up/Dn/N/P] ", style="bold green"); ft.append("Station  ", style="white")
+        
+        # Live Audio Toggle Key [T]
+        if self.live_audio_active:
+            ft.append("[T] ", style="bold green"); ft.append("MUTE AUDIO  ", style="bold green blink")
+        else:
+            ft.append("[T] ", style="bold green"); ft.append("Tune Live  ", style="white")
+
+        ft.append("[S] ", style="bold cyan"); ft.append("Scan Hot  ", style="white")
         ft.append("| MATRIX: ", style="bold yellow")
         ft.append("[1] ", style="bold green"); ft.append("Audit  ", style="white")
         ft.append("[2] ", style="bold cyan"); ft.append("Drift  ", style="white")
@@ -571,6 +755,7 @@ class SDRScout:
                     else:
                         ch = raw.decode("utf-8", errors="ignore").lower()
                         if ch == "q":
+                            self.stop_live_tune()
                             if self.tcp_process:
                                 self.tcp_process.terminate()
                             if self.logger_proc:
@@ -581,6 +766,10 @@ class SDRScout:
                             self.select_station(self.selected_station_idx + 1)
                         elif ch in ("p", "k"):  # Previous station
                             self.select_station(self.selected_station_idx - 1)
+                        elif ch == "t":
+                            self.toggle_live_tune()
+                        elif ch == "s":
+                            threading.Thread(target=self.run_ares_scan, daemon=True).start()
                         elif ch == "1":
                             threading.Thread(target=self.run_hardware_audit, daemon=True).start()
                         elif ch == "2":
@@ -591,8 +780,6 @@ class SDRScout:
                             threading.Thread(target=self.run_adsb_scout, daemon=True).start()
                         elif ch == "5":
                             threading.Thread(target=self.toggle_audio_logger, daemon=True).start()
-                        elif ch == "t":
-                            threading.Thread(target=self.tune_live_selected, daemon=True).start()
                         elif ch == "6":
                             threading.Thread(target=self.toggle_rtl_tcp, daemon=True).start()
                         elif ch == "7":

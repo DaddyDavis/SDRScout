@@ -10,7 +10,8 @@ SDRScout is a 1-click tactical terminal HUD and signal diagnostic engine built f
 | :--- | :--- | :--- |
 | `[Up]` / `[Down]` | Scroll Station List | Moves cursor up/down through repeater channels, highlights active row, and copies frequency to clipboard. |
 | `[N]` / `[P]` | Next / Previous Station | Ergonomic single-hand alternative to arrow keys for switching channels. |
-| `[T]` | Tune Live Demod | Immediately tunes to and plays the selected repeater channel in real-time. |
+| `[T]` | Live Audio Stream (Toggle) | Pipes `rtl_fm` demod directly into `ffplay` to listen to the selected channel in real-time. Press again to mute. |
+| `[S]` | ARES Hot Carrier Scan | Sweeps 10 local repeaters for active voice traffic. Snaps cursor to whichever channel breaks squelch. |
 | `[Space]` | Copy Frequency | Copies the active channel's frequency directly to Windows clipboard with click chime. |
 | `[1]` | Hardware & Gain Audit | Verifies USB throughput at 2.4 MSPS, checks 29 tuner gain steps, tests for dropped samples. |
 | `[2]` | PPM Thermal Drift | Benchmarks crystal oscillator error over time, confirming 0.5 PPM TCXO frequency stability. |
@@ -26,6 +27,8 @@ SDRScout is a 1-click tactical terminal HUD and signal diagnostic engine built f
 
 ## Supercharged Tactical Telemetry
 
+- **Live Real-Time Audio Demodulation**: Pipes `rtl_fm.exe` S16LE raw audio samples into `ffplay.exe` without window popups, outputting audio cleanly through laptop speakers or FxSound.
+- **Smart Non-Blocking RF Poller**: A background worker thread polls 2-meter band noise energy every 3.5 seconds, dynamically updating the ASCII meter without interfering with active tests or audio playback.
+- **ARES Priority Activity Scanner**: Rapidly measures power across local emergency repeaters and locks onto active carrier transmissions with audio prompt alerts.
 - **Visual Anti-Freeze Heartbeat**: Real-time rotating ASCII radar pulse (`|`, `/`, `-`, `\`) in the header confirms the Python event loop and USB driver have not frozen.
-- **Live ASCII Noise Floor & SNR Meter**: Measures 2M band RF energy in real-time: `[||||||||||    ] -17.2 dBFS (NORMAL RF NOISE FLOOR)`. Warns in bright red if disconnected or open coax (< -45 dBFS).
-- **Color-Coded Overload Protection**: Automatically detects when tuner gain exceeds 20.0 dB with an active LNA to prevent front-end clipping and harmonic distortion.
+- **Color-Coded Overload Protection**: Automatically detects when tuner gain exceeds 20.0 dB to prevent front-end clipping and harmonic distortion.
