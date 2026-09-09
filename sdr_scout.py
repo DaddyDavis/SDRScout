@@ -913,25 +913,26 @@ class SDRScout:
         # Header with Heartbeat & Gain Overload Protection
         hdr = Text()
         hdr.append("SDR SCOUT ", style="bold green")
-        hdr.append("| TACTICAL SIGNAL DIAGNOSTIC & RADIO TOOLKIT  ", style="bold white")
-        hdr.append(f"[DEVICE: {self.hardware_status}]  ", style="bold yellow")
+        hdr.append("| ", style="dim white")
+        hdr.append(f"[{self.hardware_status}] ", style="bold yellow")
         
         # Gain badge in orange
         if self.active_gain_db > 36.0:
-            hdr.append(f"[GAIN: {self.active_gain_db:.1f} dB (MAX)]  ", style="bold #ff8c00 blink")
+            hdr.append(f"[GAIN: {self.active_gain_db:.1f}dB] ", style="bold #ff8c00 blink")
         elif self.active_gain_db > 20.0:
-            hdr.append(f"[GAIN: {self.active_gain_db:.1f} dB (HIGH)]  ", style="bold #ff8c00")
+            hdr.append(f"[GAIN: {self.active_gain_db:.1f}dB] ", style="bold #ff8c00")
         else:
-            hdr.append(f"[GAIN: {self.active_gain_db:.1f} dB]  ", style="bold #ffa500")
+            hdr.append(f"[GAIN: {self.active_gain_db:.1f}dB] ", style="bold #ffa500")
 
         # AI Comms SIGINT Badge (Popping Cyan/Neon Blue)
         if self.ai_comms_active:
             freq_str = self.active_tune_freq or (self.selected_freq_obj.get("freq", "") if self.selected_freq_obj else "")
-            mode_badge = "SILENT" if self.ai_silent_mode else "AUDIO ON"
-            hdr.append(f"[bold #00ffff blink]AI COMMS HOT[/bold #00ffff blink] [bold #00d4ff]({mode_badge}: {freq_str} MHz)[/bold #00d4ff]  ")
+            mode_badge = "SILENT" if self.ai_silent_mode else "AUDIO"
+            hdr.append("[AI COMMS HOT] ", style="bold #00ffff blink")
+            hdr.append(f"({mode_badge}: {freq_str} MHz) ", style="bold #00d4ff")
         elif self.live_audio_active:
             freq_str = self.active_tune_freq or (self.selected_freq_obj.get("freq", "") if self.selected_freq_obj else "")
-            hdr.append(f"[LIVE AUDIO: {freq_str} MHz]  ", style="bold red blink")
+            hdr.append(f"[LIVE AUDIO: {freq_str} MHz] ", style="bold red blink")
 
         # Heartbeat pulse
         hdr.append(f"[PULSE: {pulse_char} {now_time}]", style="bold cyan")
