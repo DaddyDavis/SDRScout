@@ -115,6 +115,7 @@ class SDRScout:
         self.live_audio_active = False
         self.live_tune_rtl_proc = None
         self.live_tune_ffplay_proc = None
+        self.squelch_active = False  # False = raw static/carrier; True = static-free squelched
 
         # Visual Heartbeat State
         self.spinner_chars = ["|", "/", "-", "\\"]
@@ -123,12 +124,12 @@ class SDRScout:
         self.diagnostic_analysis = [
             "[bold green]SYSTEM READY:[/bold green] Nooelec NESDR SMArt v5 connected.",
             "[bold cyan]TELEMETRY:[/bold cyan] 12.5 dB hardware gain locked. R820T TCXO calibrated.",
-            "[bold white]CONTROLS:[/bold white] [Up/Dn/N/P] Station | [T] Live Audio | [S] Scan Hot | [1]-[8] Matrix."
+            "[bold white]CONTROLS:[/bold white] [T] Live Audio | [W] NOAA 24/7 Voice | [O] Squelch | [S] Scan Hot."
         ]
         self.raw_output_lines = []
         self.tcp_process = None
 
-        # Start continuous background idle RF poller
+        # Start background idle RF poller
         self.start_rf_poller_thread()
 
     def select_station(self, new_idx):
@@ -143,7 +144,7 @@ class SDRScout:
         self.diagnostic_analysis = [
             f"[bold green]SELECTED STATION #{self.selected_station_idx + 1}:[/bold green] {f_item.get('name')} ({freq_val} MHz).",
             f"[bold cyan]REPEATER SPECS:[/bold cyan] Offset {f_item.get('offset')} | CTCSS Tone {f_item.get('tone')} Hz.",
-            "[bold yellow]1-KEY ACTION:[/bold yellow] Press [T] to tune live NFM demod, or [5] to record audio."
+            "[bold yellow]1-KEY ACTION:[/bold yellow] Press [T] to listen live, [W] for NOAA weather, or [5] to record."
         ]
 
     def acquire_single_instance_lock(self):
@@ -191,7 +192,7 @@ class SDRScout:
 
     def _rf_poller_loop(self):
         while self.running:
-            time.sleep(3.5)
+            time.sleep(8.0)
             # Only poll when completely idle
             if not self.is_busy and not self.live_audio_active and not self.audio_logger_active and not self.tcp_process:
                 try:
@@ -431,23 +432,26 @@ class SDRScout:
                 self.diagnostic_analysis = [f"[bold red]LOGGER ERROR:[/bold red] {str(e)}"]
 
     # Key [T]: Toggle Live Audio Stream (rtl_fm -> ffplay)
-    def toggle_live_tune(self):
+    def toggle_live_tune(self, custom_freq=None, custom_name=None):
         if self.live_audio_active:
             self.stop_live_tune()
             play_chime("click")
             self.diagnostic_analysis = [
                 "[bold yellow]LIVE AUDIO MUTED.[/bold yellow]",
-                "[bold cyan]STATUS:[/bold cyan] Demodulator released. Background RF power polling resumed.",
-                "[bold white]CONTROLS:[/bold white] Press [T] to resume listening, or [5] to log audio to disk."
+                "[bold cyan]STATUS:[/bold cyan] Demodulator released. Tuner free.",
+                "[bold white]CONTROLS:[/bold white] Press [T] to resume listening, or [W] for NOAA weather."
             ]
         else:
             if self.audio_logger_active:
                 self.toggle_audio_logger()
-            if not self.selected_freq_obj:
-                return
-            freq = self.selected_freq_obj.get("freq", "147.285")
-            name = self.selected_freq_obj.get("name", "Repeater")
+            
+            freq = custom_freq if custom_freq else (self.selected_freq_obj.get("freq", "147.285") if self.selected_freq_obj else "147.285")
+            name = custom_name if custom_name else (self.selected_freq_obj.get("name", "Repeater") if self.selected_freq_obj else "Repeater")
             freq_hz = str(int(float(freq) * 1000000))
+            
+            # Kill any lingering background processes to guarantee clean USB bus access
+            subprocess.run(["taskkill", "/F", "/IM", "rtl_power.exe"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(0.15)
             
             rtl_exe = self.get_rtl_exe("rtl_fm.exe")
             ffplay_exe = self.get_ffplay_exe()
@@ -457,21 +461,38 @@ class SDRScout:
                 self.active_test_name = f"Live Monitor ({freq} MHz)"
                 self.hardware_status = f"LIVE AUDIO: {freq} MHz"
                 
-                # Pipe rtl_fm raw PCM S16LE directly into ffplay
+                squelch_args = ["-l", "45"] if self.squelch_active else ["-l", "0"]
+                
+                # Start rtl_fm piping into ffplay with de-emphasis filter (-E deemp)
                 self.live_tune_rtl_proc = subprocess.Popen(
-                    [rtl_exe, "-f", freq_hz, "-M", "fm", "-s", "24000", "-r", "24000", "-l", "0", "-"],
-                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+                    [rtl_exe, "-f", freq_hz, "-M", "fm", "-s", "24000", "-r", "24000", "-E", "deemp"] + squelch_args + ["-"],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE
                 )
+                
+                time.sleep(0.2)
+                if self.live_tune_rtl_proc.poll() is not None:
+                    _, err = self.live_tune_rtl_proc.communicate()
+                    err_msg = err.decode("utf-8", errors="ignore").strip()
+                    self.stop_live_tune()
+                    self.diagnostic_analysis = [
+                        "[bold red]TUNER HARDWARE ERROR:[/bold red] rtl_fm failed to claim dongle.",
+                        f"[dim yellow]{err_msg[:65]}[/dim yellow]",
+                        "[bold white]ACTION:[/bold white] Tap [T] again to re-engage."
+                    ]
+                    return
+
                 self.live_tune_ffplay_proc = subprocess.Popen(
-                    [ffplay_exe, "-nodisp", "-autoexit", "-loglevel", "quiet", "-f", "s16le", "-ar", "24000", "-ac", "1", "-i", "-"],
+                    [ffplay_exe, "-nodisp", "-f", "s16le", "-ar", "24000", "-ac", "1", "-i", "-"],
                     stdin=self.live_tune_rtl_proc.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
                 )
                 self.live_audio_active = True
                 play_chime("success")
+                
+                sq_mode = "SQUELCHED (Static-free until voice transmission)" if self.squelch_active else "OPEN SQUELCH (Raw static/carrier audible)"
                 self.diagnostic_analysis = [
-                    f"[bold green]LIVE NFM DEMOD STREAMING:[/bold green] {name} ({freq} MHz).",
-                    f"[bold cyan]AUDIO PIPELINE:[/bold cyan] rtl_fm (24k S16LE) -> ffplay -> Windows Audio / FxSound.",
-                    "[bold white]TACTICAL CONTROL:[/bold white] Press [T] again to mute audio stream and free tuner."
+                    f"[bold green]LIVE AUDIO STREAMING:[/bold green] {name} ({freq} MHz).",
+                    f"[bold cyan]SQUELCH GATE:[/bold cyan] {sq_mode}.",
+                    "[bold yellow]CONTROLS:[/bold yellow] Press [O] to toggle squelch | [T] to mute | [W] for NOAA voice."
                 ]
             except Exception as e:
                 self.stop_live_tune()
@@ -495,6 +516,25 @@ class SDRScout:
         self.live_audio_active = False
         self.hardware_status = "READY"
         self.is_busy = False
+
+    def toggle_squelch(self):
+        self.squelch_active = not self.squelch_active
+        play_chime("click")
+        mode = "SQUELCHED (Static-free)" if self.squelch_active else "OPEN SQUELCH (Raw static audible)"
+        if self.live_audio_active:
+            # Re-tune live with updated squelch setting
+            self.stop_live_tune()
+            self.toggle_live_tune()
+        else:
+            self.diagnostic_analysis = [
+                f"[bold cyan]SQUELCH MODE:[/bold cyan] Set to {mode}.",
+                "[bold white]NOTE:[/bold white] Tap [T] to listen to active repeater with this setting."
+            ]
+
+    def tune_noaa_live(self):
+        play_chime("click")
+        # Direct tuning to 162.550 MHz (Mobile/Gulf Coast NOAA Weather KEC61)
+        self.toggle_live_tune(custom_freq="162.550", custom_name="NOAA Weather 24/7 (KEC61)")
 
     # Key [S]: ARES Priority Activity Scanner
     def run_ares_scan(self):
@@ -710,31 +750,33 @@ class SDRScout:
         layout["main"]["right_panel"].update(Panel(freq_table, title=right_panel_title, border_style="yellow"))
 
         # Footer Menu
-        ft = Text(" NAV: ", style="bold green")
-        ft.append("[Up/Dn/N/P] ", style="bold green"); ft.append("Station  ", style="white")
-        
-        # Live Audio Toggle Key [T]
+        ft = Text(" AUDIO: ", style="bold green")
         if self.live_audio_active:
-            ft.append("[T] ", style="bold green"); ft.append("MUTE AUDIO  ", style="bold green blink")
+            ft.append("[T] ", style="bold green"); ft.append("MUTE  ", style="bold green blink")
         else:
             ft.append("[T] ", style="bold green"); ft.append("Tune Live  ", style="white")
 
+        ft.append("[W] ", style="bold yellow"); ft.append("NOAA Voice  ", style="white")
+        
+        sq_label = "Squelched" if self.squelch_active else "Open Static"
+        ft.append("[O] ", style="bold cyan"); ft.append(f"{sq_label}  ", style="white")
         ft.append("[S] ", style="bold cyan"); ft.append("Scan Hot  ", style="white")
+        
         ft.append("| MATRIX: ", style="bold yellow")
-        ft.append("[1] ", style="bold green"); ft.append("Audit  ", style="white")
-        ft.append("[2] ", style="bold cyan"); ft.append("Drift  ", style="white")
-        ft.append("[3] ", style="bold yellow"); ft.append("NOAA  ", style="white")
-        ft.append("[4] ", style="bold magenta"); ft.append("ADS-B  ", style="white")
+        ft.append("[1] ", style="bold green"); ft.append("Audit ", style="white")
+        ft.append("[2] ", style="bold cyan"); ft.append("Drift ", style="white")
+        ft.append("[3] ", style="bold yellow"); ft.append("NOAA ", style="white")
+        ft.append("[4] ", style="bold magenta"); ft.append("ADS-B ", style="white")
         
         # Audio Logger Key 5
         if self.audio_logger_active:
-            ft.append("[5] ", style="bold red"); ft.append("STOP REC  ", style="bold red blink")
+            ft.append("[5] ", style="bold red"); ft.append("STOP REC ", style="bold red blink")
         else:
-            ft.append("[5] ", style="bold red"); ft.append("Rec  ", style="white")
+            ft.append("[5] ", style="bold red"); ft.append("Rec ", style="white")
 
-        ft.append("[6] ", style="bold blue"); ft.append("TCP  ", style="white")
-        ft.append("[7] ", style="bold green"); ft.append("Console  ", style="white")
-        ft.append("[8] ", style="bold cyan"); ft.append("SDR++  ", style="white")
+        ft.append("[6] ", style="bold blue"); ft.append("TCP ", style="white")
+        ft.append("[7] ", style="bold green"); ft.append("Console ", style="white")
+        ft.append("[8] ", style="bold cyan"); ft.append("SDR++ ", style="white")
         ft.append("[Q] ", style="bold red"); ft.append("Quit", style="white")
         layout["footer"].update(Panel(ft, style="white on #030508", border_style="yellow"))
 
@@ -768,6 +810,10 @@ class SDRScout:
                             self.select_station(self.selected_station_idx - 1)
                         elif ch == "t":
                             self.toggle_live_tune()
+                        elif ch == "w":
+                            self.tune_noaa_live()
+                        elif ch == "o":
+                            self.toggle_squelch()
                         elif ch == "s":
                             threading.Thread(target=self.run_ares_scan, daemon=True).start()
                         elif ch == "1":
