@@ -101,6 +101,7 @@ class SDRScout:
         self.active_gain_db = 12.5
         self.is_overload_risk = False
         self.rf_power_dbfs = -17.2
+        self.selected_station_idx = 0
         self.selected_freq_obj = self.frequencies[0] if self.frequencies else None
         
         # Audio Logger State
@@ -115,10 +116,25 @@ class SDRScout:
         self.diagnostic_analysis = [
             "[bold green]SYSTEM READY:[/bold green] Nooelec NESDR SMArt v5 connected.",
             "[bold cyan]TELEMETRY:[/bold cyan] 12.5 dB hardware gain locked. R820T TCXO calibrated.",
-            "[bold white]CONTROLS:[/bold white] Press [1]-[8] for diagnostics, [0]-[9] to select repeaters."
+            "[bold white]CONTROLS:[/bold white] [Up/Down or N/P] Select Station | [T] Tune | [1]-[8] Matrix Diagnostics."
         ]
         self.raw_output_lines = []
         self.tcp_process = None
+
+    def select_station(self, new_idx):
+        if not self.frequencies:
+            return
+        self.selected_station_idx = new_idx % len(self.frequencies)
+        self.selected_freq_obj = self.frequencies[self.selected_station_idx]
+        f_item = self.selected_freq_obj
+        freq_val = f_item.get("freq", "")
+        copy_to_clipboard(freq_val)
+        play_chime("click")
+        self.diagnostic_analysis = [
+            f"[bold green]SELECTED STATION #{self.selected_station_idx + 1}:[/bold green] {f_item.get('name')} ({freq_val} MHz).",
+            f"[bold cyan]REPEATER SPECS:[/bold cyan] Offset {f_item.get('offset')} | CTCSS Tone {f_item.get('tone')} Hz.",
+            "[bold yellow]1-KEY ACTION:[/bold yellow] Press [T] to tune live NFM demod, or [5] to record audio."
+        ]
 
     def acquire_single_instance_lock(self):
         try:
@@ -497,14 +513,17 @@ class SDRScout:
         freq_table.add_column("Offset", style="dim", width=7)
         freq_table.add_column("Tone", style="yellow", width=6)
 
-        for item in self.frequencies[:10]:
-            sel_marker = ">" if self.selected_freq_obj and self.selected_freq_obj.get("freq") == item.get("freq") else " "
+        for idx, item in enumerate(self.frequencies[:10]):
+            is_sel = (self.selected_station_idx == idx)
+            sel_marker = ">" if is_sel else " "
+            row_style = "bold green" if is_sel else ""
             freq_table.add_row(
-                f"{sel_marker}{item.get('id', '0')}",
+                f"{sel_marker}{idx + 1}",
                 item.get("name", "N/A")[:18],
                 item.get("freq", "0.0"),
                 item.get("offset", ""),
-                item.get("tone", "")
+                item.get("tone", ""),
+                style=row_style
             )
 
         right_panel_title = "Lucedale & George Co ARES Matrix"
@@ -514,7 +533,10 @@ class SDRScout:
         layout["main"]["right_panel"].update(Panel(freq_table, title=right_panel_title, border_style="yellow"))
 
         # Footer Menu
-        ft = Text(" 1-KEY MATRIX: ", style="bold yellow")
+        ft = Text(" NAV: ", style="bold green")
+        ft.append("[Up/Dn or N/P] ", style="bold green"); ft.append("Station  ", style="white")
+        ft.append("[T] ", style="bold green"); ft.append("Tune  ", style="white")
+        ft.append("| MATRIX: ", style="bold yellow")
         ft.append("[1] ", style="bold green"); ft.append("Audit  ", style="white")
         ft.append("[2] ", style="bold cyan"); ft.append("Drift  ", style="white")
         ft.append("[3] ", style="bold yellow"); ft.append("NOAA  ", style="white")
@@ -524,11 +546,10 @@ class SDRScout:
         if self.audio_logger_active:
             ft.append("[5] ", style="bold red"); ft.append("STOP REC  ", style="bold red blink")
         else:
-            ft.append("[5] ", style="bold red"); ft.append("Audio Log  ", style="white")
+            ft.append("[5] ", style="bold red"); ft.append("Rec  ", style="white")
 
-        ft.append("[T] ", style="bold green"); ft.append("Tune Live  ", style="white")
-        ft.append("[6] ", style="bold blue"); ft.append("RTL-TCP  ", style="white")
-        ft.append("[7] ", style="bold green"); ft.append("SDR Console  ", style="white")
+        ft.append("[6] ", style="bold blue"); ft.append("TCP  ", style="white")
+        ft.append("[7] ", style="bold green"); ft.append("Console  ", style="white")
         ft.append("[8] ", style="bold cyan"); ft.append("SDR++  ", style="white")
         ft.append("[Q] ", style="bold red"); ft.append("Quit", style="white")
         layout["footer"].update(Panel(ft, style="white on #030508", border_style="yellow"))
@@ -539,45 +560,50 @@ class SDRScout:
         with Live(self.build_layout(), refresh_per_second=2, screen=True) as live:
             while self.running:
                 if msvcrt.kbhit():
-                    ch = msvcrt.getch().decode("utf-8", errors="ignore").lower()
-                    if ch == "q":
-                        if self.tcp_process:
-                            self.tcp_process.terminate()
-                        if self.logger_proc:
-                            self.logger_proc.kill()
-                        self.running = False
-                        break
-                    elif ch == "1":
-                        threading.Thread(target=self.run_hardware_audit, daemon=True).start()
-                    elif ch == "2":
-                        threading.Thread(target=self.run_ppm_calibration, daemon=True).start()
-                    elif ch == "3":
-                        threading.Thread(target=self.run_noaa_check, daemon=True).start()
-                    elif ch == "4":
-                        threading.Thread(target=self.run_adsb_scout, daemon=True).start()
-                    elif ch == "5":
-                        threading.Thread(target=self.toggle_audio_logger, daemon=True).start()
-                    elif ch == "t":
-                        threading.Thread(target=self.tune_live_selected, daemon=True).start()
-                    elif ch == "6":
-                        threading.Thread(target=self.toggle_rtl_tcp, daemon=True).start()
-                    elif ch == "7":
-                        self.launch_sdr_console()
-                    elif ch == "8":
-                        self.launch_sdrpp()
-                    elif ch in ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]:
-                        idx = int(ch) - 1 if ch != "0" else 9
-                        if 0 <= idx < len(self.frequencies):
-                            self.selected_freq_obj = self.frequencies[idx]
-                            f_item = self.selected_freq_obj
-                            freq_val = f_item.get("freq", "")
-                            if copy_to_clipboard(freq_val):
+                    raw = msvcrt.getch()
+                    # Handle arrow keys (prefixed by \x00 or \xe0 in Windows console)
+                    if raw in (b'\x00', b'\xe0'):
+                        arrow = msvcrt.getch()
+                        if arrow == b'H':  # Up Arrow
+                            self.select_station(self.selected_station_idx - 1)
+                        elif arrow == b'P':  # Down Arrow
+                            self.select_station(self.selected_station_idx + 1)
+                    else:
+                        ch = raw.decode("utf-8", errors="ignore").lower()
+                        if ch == "q":
+                            if self.tcp_process:
+                                self.tcp_process.terminate()
+                            if self.logger_proc:
+                                self.logger_proc.kill()
+                            self.running = False
+                            break
+                        elif ch in ("n", "j"):  # Next station
+                            self.select_station(self.selected_station_idx + 1)
+                        elif ch in ("p", "k"):  # Previous station
+                            self.select_station(self.selected_station_idx - 1)
+                        elif ch == "1":
+                            threading.Thread(target=self.run_hardware_audit, daemon=True).start()
+                        elif ch == "2":
+                            threading.Thread(target=self.run_ppm_calibration, daemon=True).start()
+                        elif ch == "3":
+                            threading.Thread(target=self.run_noaa_check, daemon=True).start()
+                        elif ch == "4":
+                            threading.Thread(target=self.run_adsb_scout, daemon=True).start()
+                        elif ch == "5":
+                            threading.Thread(target=self.toggle_audio_logger, daemon=True).start()
+                        elif ch == "t":
+                            threading.Thread(target=self.tune_live_selected, daemon=True).start()
+                        elif ch == "6":
+                            threading.Thread(target=self.toggle_rtl_tcp, daemon=True).start()
+                        elif ch == "7":
+                            self.launch_sdr_console()
+                        elif ch == "8":
+                            self.launch_sdrpp()
+                        elif ch == " ":
+                            if self.selected_freq_obj:
+                                freq_val = self.selected_freq_obj.get("freq", "")
+                                copy_to_clipboard(freq_val)
                                 play_chime("click")
-                                self.diagnostic_analysis = [
-                                    f"[bold green]SELECTED & COPIED:[/bold green] {freq_val} MHz ({f_item.get('name')}).",
-                                    f"[bold cyan]DATA:[/bold cyan] Offset {f_item.get('offset')} | CTCSS Tone {f_item.get('tone')} Hz.",
-                                    "[bold yellow]1-KEY ACTION:[/bold yellow] Press [T] to tune live NFM demod, or [5] to start audio logging."
-                                ]
 
                 live.update(self.build_layout())
                 time.sleep(0.5)
