@@ -115,6 +115,8 @@ class SDRScout:
 
         # Live Audio Streaming State (Key [T])
         self.live_audio_active = False
+        self.active_tune_freq = None
+        self.active_tune_name = None
         self.live_tune_rtl_proc = None
         self.live_tune_ffplay_proc = None
         self.squelch_active = False  # False = raw static/carrier; True = static-free squelched
@@ -252,10 +254,12 @@ class SDRScout:
             "[bold white]TACTICAL ADVICE:[/bold white] High gain (36-44 dB) helps pull weak signals through lossy coax."
         ]
 
-        # If live audio is currently playing, dynamically re-tune with new gain
+        # If live audio is currently playing, dynamically re-tune with new gain on same station
         if self.live_audio_active:
+            f_target = self.active_tune_freq
+            n_target = self.active_tune_name
             self.stop_live_tune()
-            self.toggle_live_tune()
+            self.toggle_live_tune(custom_freq=f_target, custom_name=n_target)
 
     # Test 1: Hardware & Gain Audit + Power Check
     def run_hardware_audit(self):
@@ -481,6 +485,8 @@ class SDRScout:
             
             freq = custom_freq if custom_freq else (self.selected_freq_obj.get("freq", "147.285") if self.selected_freq_obj else "147.285")
             name = custom_name if custom_name else (self.selected_freq_obj.get("name", "Repeater") if self.selected_freq_obj else "Repeater")
+            self.active_tune_freq = freq
+            self.active_tune_name = name
             freq_hz = str(int(float(freq) * 1000000))
             
             # Kill any lingering background processes to guarantee clean USB bus access
@@ -557,9 +563,11 @@ class SDRScout:
         play_chime("click")
         mode = "SQUELCHED (Static-free)" if self.squelch_active else "OPEN SQUELCH (Raw static audible)"
         if self.live_audio_active:
-            # Re-tune live with updated squelch setting
+            # Re-tune live with updated squelch setting on current active frequency
+            f_target = self.active_tune_freq
+            n_target = self.active_tune_name
             self.stop_live_tune()
-            self.toggle_live_tune()
+            self.toggle_live_tune(custom_freq=f_target, custom_name=n_target)
         else:
             self.diagnostic_analysis = [
                 f"[bold cyan]SQUELCH MODE:[/bold cyan] Set to {mode}.",
@@ -710,7 +718,7 @@ class SDRScout:
 
         # Live Audio Streaming badge
         if self.live_audio_active:
-            freq_str = self.selected_freq_obj.get("freq", "") if self.selected_freq_obj else ""
+            freq_str = self.active_tune_freq or (self.selected_freq_obj.get("freq", "") if self.selected_freq_obj else "")
             hdr.append(f"[LIVE AUDIO: {freq_str} MHz]  ", style="bold red blink")
 
         # Heartbeat pulse
